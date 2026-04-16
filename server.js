@@ -114,12 +114,60 @@ try {
 } catch { hasChromeAvailable = false; }
 console.log(`[配置] Chrome 可用: ${hasChromeAvailable}`);
 
-// 用 ffmpeg 探测文件是否包含视频轨道
-const probeHasVideo = (filePath) => {
+// 用 ffmpeg 探测文件信息（是否有视频、编码格式）
+const probeFile = (filePath) => {
     try {
         const out = execSync(`"${ffmpegPath}" -i "${filePath}" 2>&1 || true`, { encoding: 'utf-8', timeout: 10000 });
-        return /Stream.*Video:/i.test(out);
-    } catch { return false; }
+        const hasVideo = /Stream.*Video:/i.test(out);
+        const hasAudio = /Stream.*Audio:/i.test(out);
+        // 检测视频编码
+        const codecMatch = out.match(/Stream.*Video:\s*(\w+)/i);
+        const vcodec = codecMatch ? codecMatch[1].toLowerCase() : '';
+        return { hasVideo, hasAudio, vcodec };
+    } catch { return { hasVideo: false, hasAudio: false, vcodec: '' }; }
+};
+
+// 如果视频编码不是 h264，转码为 h264（iOS 兼容）
+const reencodeToH264 = (inputPath) => {
+    return new Promise((resolve, reject) => {
+        const info = probeFile(inputPath);
+        // 已经是 h264 或没有视频轨道，不需要转码
+        if (!info.hasVideo || info.vcodec === 'h264' || info.vcodec === 'avc1' || info.vcodec === 'avc') {
+            return resolve(inputPath);
+        }
+        console.log(`[转码] ${info.vcodec} -> h264: ${path.basename(inputPath)}`);
+        const outPath = inputPath.replace(/(\.\w+)$/, '_h264$1');
+        const args = [
+            '-i', inputPath,
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-movflags', '+faststart',
+            '-y',
+            outPath
+        ];
+        const child = spawn(ffmpegPath, args);
+        let stderr = '';
+        child.stderr.on('data', d => { stderr += d.toString(); });
+        child.on('error', err => {
+            console.error('[转码错误]', err.message);
+            resolve(inputPath); // 转码失败就用原文件
+        });
+        child.on('close', code => {
+            if (code === 0 && fs.existsSync(outPath)) {
+                const oldSize = fs.statSync(inputPath).size;
+                const newSize = fs.statSync(outPath).size;
+                console.log(`[转码] 完成: ${(oldSize/1048576).toFixed(1)}MB -> ${(newSize/1048576).toFixed(1)}MB`);
+                fs.unlink(inputPath, () => {}); // 删除原文件
+                resolve(outPath);
+            } else {
+                console.error('[转码] 失败:', stderr.substring(0, 200));
+                resolve(inputPath); // 转码失败就用原文件
+            }
+        });
+    });
 };
 
 // 通用 yt-dlp 下载参数
@@ -127,12 +175,21 @@ const buildYtdlpArgs = (url, outputPath, maxHeight, forceVideo = true) => {
     const args = [url];
 
     if (forceVideo) {
-        // 强制选包含视频的格式，绝不选纯音频
-        // bv*+ba = 最佳视频(可能含音频) + 最佳音频
-        // b = 最佳已合并格式 (作为后备)
-        // 所有格式都要求 vcodec!=none (排除纯音频)
-        let heightFilter = maxHeight ? `[height<=${maxHeight}]` : '';
-        args.push('-f', `bv*${heightFilter}[vcodec!=none]+ba[ext=m4a]/bv*${heightFilter}[vcodec!=none]+ba/bv*${heightFilter}[vcodec!=none]/b${heightFilter}[vcodec!=none]/b${heightFilter}`);
+        // 优先选 h264 编码（iOS 兼容），然后才选其他编码
+        let hf = maxHeight ? `[height<=${maxHeight}]` : '';
+        args.push('-f', [
+            // 第一优先：h264 视频 + aac 音频（最佳兼容性）
+            `bv*${hf}[vcodec^=avc]+ba[ext=m4a]`,
+            `bv*${hf}[vcodec^=avc]+ba`,
+            `bv*${hf}[vcodec^=avc]`,
+            // 第二优先：h264 已合并格式
+            `b${hf}[vcodec^=avc]`,
+            // 第三优先：任何有视频的格式（VP9/AV1 等，后续会转码）
+            `bv*${hf}[vcodec!=none]+ba`,
+            `bv*${hf}[vcodec!=none]`,
+            `b${hf}[vcodec!=none]`,
+            `b${hf}`
+        ].join('/'));
     }
 
     // 排序偏好 h264+aac+mp4
@@ -307,7 +364,7 @@ app.get('/api/preview', (req, res) => {
             return;
         }
 
-        const actualFile = findOutputFile(tmpFile);
+        let actualFile = findOutputFile(tmpFile);
         if (!actualFile) {
             entry.clients.forEach(c => { if (!c.headersSent) c.status(500).send('预览文件未生成'); });
             entry.clients = [];
@@ -316,14 +373,17 @@ app.get('/api/preview', (req, res) => {
         }
 
         const sizeMB = (fs.statSync(actualFile).size / 1024 / 1024).toFixed(1);
-        console.log(`[预览] 完成: ${sizeMB}MB`);
-        entry.filePath = actualFile;
-        entry.ready = true;
-        entry.clients.forEach(c => { if (!c.headersSent) c.sendFile(actualFile); });
-        entry.clients = [];
+        console.log(`[预览] 下载完成: ${sizeMB}MB，检查编码...`);
 
-        // 30 分钟后清理
-        setTimeout(() => { fs.unlink(actualFile, () => {}); previewCache.delete(pageUrl); }, 1800000);
+        // 如果不是 h264，转码为 h264（确保 iOS 能播放）
+        reencodeToH264(actualFile).then(finalFile => {
+            entry.filePath = finalFile;
+            entry.ready = true;
+            entry.clients.forEach(c => { if (!c.headersSent) c.sendFile(finalFile); });
+            entry.clients = [];
+            // 30 分钟后清理
+            setTimeout(() => { fs.unlink(finalFile, () => {}); previewCache.delete(pageUrl); }, 1800000);
+        });
     });
 
     res.on('close', () => {
@@ -416,28 +476,34 @@ app.get('/api/download', (req, res) => {
                 return;
             }
 
-            const stat = fs.statSync(actualFile);
-            const sizeMB = (stat.size / 1024 / 1024).toFixed(1);
-            const hasVideo = probeHasVideo(actualFile);
-            console.log(`[下载] 尝试 #${attempt} 完成: ${sizeMB}MB, 含视频=${hasVideo}`);
+            const info = probeFile(actualFile);
+            const sizeMB = (fs.statSync(actualFile).size / 1048576).toFixed(1);
+            console.log(`[下载] 尝试 #${attempt} 完成: ${sizeMB}MB, 含视频=${info.hasVideo}, 编码=${info.vcodec}`);
 
             // 第一次下载得到纯音频 → 宽松模式重试
-            if (!hasVideo && attempt === 1) {
+            if (!info.hasVideo && attempt === 1) {
                 console.log('[下载] 输出是纯音频，用宽松模式重试...');
                 fs.unlink(actualFile, () => {});
                 return doDownload(2);
             }
 
-            const ext = path.extname(actualFile).toLowerCase() || '.mp4';
-            const contentType = hasVideo ? 'video/mp4' : 'audio/mp4';
-            res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeTitle)}${ext}"`);
-            res.setHeader('Content-Type', contentType);
-            res.setHeader('Content-Length', stat.size);
+            // 如果不是 h264，转码为 h264（确保手机能播放）
+            const sendFile = (filePath) => {
+                const stat = fs.statSync(filePath);
+                const ext = path.extname(filePath).toLowerCase() || '.mp4';
+                res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeTitle)}${ext}"`);
+                res.setHeader('Content-Type', 'video/mp4');
+                res.setHeader('Content-Length', stat.size);
+                const stream = fs.createReadStream(filePath);
+                stream.pipe(res);
+                stream.on('end', () => fs.unlink(filePath, () => {}));
+                stream.on('error', () => { fs.unlink(filePath, () => {}); if (!res.headersSent) res.status(500).send('下载失败'); });
+            };
 
-            const stream = fs.createReadStream(actualFile);
-            stream.pipe(res);
-            stream.on('end', () => fs.unlink(actualFile, () => {}));
-            stream.on('error', () => { fs.unlink(actualFile, () => {}); if (!res.headersSent) res.status(500).send('下载失败'); });
+            reencodeToH264(actualFile).then(finalFile => {
+                if (res.headersSent) { fs.unlink(finalFile, () => {}); return; }
+                sendFile(finalFile);
+            });
         });
 
         res.on('close', () => {
