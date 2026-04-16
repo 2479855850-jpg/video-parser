@@ -931,7 +931,23 @@
             modalContent.innerHTML = '';
             if (isCurrentVideo) {
                 galleryControls.classList.remove('visible');
-                modalContent.innerHTML = `<video src="${currentMediaList[0]}" controls autoplay playsinline webkit-playsinline controlsList="nodownload" preload="auto"></video>`;
+                // 显示加载提示（服务器需要先下载视频）
+                modalContent.innerHTML = `
+                    <div id="video-loading" style="display:flex;flex-direction:column;align-items:center;justify-content:center;width:100%;min-height:200px;color:rgba(255,255,255,0.5);gap:12px;">
+                        <div class="loading-dots" style="transform:scale(1.5);"><span></span><span></span><span></span></div>
+                        <div style="font-size:13px;">${currentLang === 'zh' ? '正在加载视频，请稍候...' : 'Loading video, please wait...'}</div>
+                    </div>
+                    <video src="${currentMediaList[0]}" controls autoplay playsinline webkit-playsinline controlsList="nodownload" preload="auto" style="display:none;width:100%;max-height:80vh;border-radius:16px;outline:none;background:#000;"></video>
+                `;
+                const videoEl = modalContent.querySelector('video');
+                const loadingEl = document.getElementById('video-loading');
+                videoEl.addEventListener('canplay', () => {
+                    if (loadingEl) loadingEl.style.display = 'none';
+                    videoEl.style.display = 'block';
+                });
+                videoEl.addEventListener('error', () => {
+                    if (loadingEl) loadingEl.innerHTML = `<div style="font-size:14px;color:#f87171;">${currentLang === 'zh' ? '视频加载失败，请尝试直接下载' : 'Video load failed, try downloading instead'}</div>`;
+                });
             } else {
                 modalContent.innerHTML = `<img src="${currentMediaList[currentIndex]}" />`;
                 if (currentMediaList.length > 1) {

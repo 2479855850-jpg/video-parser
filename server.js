@@ -1,14 +1,15 @@
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
-const { execSync } = require('child_process');
+const os = require('os');
+const { execSync, spawn } = require('child_process');
 const axios = require('axios');
 const youtubedl = require('youtube-dl-exec');
 
 const app = express();
 const PORT = process.env.PORT || 3003;
 
-// --- yt-dlp 路径动态查找 ---
+// --- yt-dlp 路径 ---
 let ytdlpPath;
 try {
     ytdlpPath = execSync(process.platform === 'win32' ? 'where yt-dlp' : 'which yt-dlp', { encoding: 'utf-8' }).trim().split('\n')[0];
@@ -18,17 +19,14 @@ try {
 console.log(`[配置] yt-dlp 路径: ${ytdlpPath}`);
 youtubedl.path = ytdlpPath;
 
-// --- ffmpeg 路径（用于音视频合并）---
+// --- ffmpeg 路径 ---
 let ffmpegPath;
 try {
     ffmpegPath = execSync(process.platform === 'win32' ? 'where ffmpeg' : 'which ffmpeg', { encoding: 'utf-8' }).trim().split('\n')[0];
 } catch {
-    try {
-        ffmpegPath = require('ffmpeg-static');
-    } catch {
-        ffmpegPath = 'ffmpeg';
-    }
+    try { ffmpegPath = require('ffmpeg-static'); } catch { ffmpegPath = 'ffmpeg'; }
 }
+const ffmpegDir = ffmpegPath.includes(path.sep) ? path.dirname(ffmpegPath) : '';
 console.log(`[配置] ffmpeg 路径: ${ffmpegPath}`);
 
 // --- 工具函数 ---
@@ -50,7 +48,6 @@ const friendlyError = (msg) => {
     return '解析失败，请检查链接是否正确或稍后重试';
 };
 
-// 根据 URL 猜测合适的 Referer
 const guessReferer = (url) => {
     try {
         const host = new URL(url).hostname;
@@ -58,34 +55,27 @@ const guessReferer = (url) => {
         if (/ytimg|youtube|googlevideo|ggpht/.test(host)) return 'https://www.youtube.com/';
         if (/bilivideo|hdslb|biliimg/.test(host)) return 'https://www.bilibili.com/';
         if (/twimg|twitter|x\.com/.test(host)) return 'https://twitter.com/';
-        if (/tiktok/.test(host)) return 'https://www.tiktok.com/';
         return '';
     } catch { return ''; }
 };
 
-// 通用代理请求头
-const proxyHeaders = (targetUrl) => {
-    const referer = guessReferer(targetUrl);
-    return {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Sec-Fetch-Dest': 'video',
-        'Sec-Fetch-Mode': 'no-cors',
-        'Sec-Fetch-Site': 'cross-site',
-        ...(referer ? { 'Referer': referer, 'Origin': referer.replace(/\/$/, '') } : {})
-    };
-};
-
-// --- 缓存：ID -> { url, sourceUrl, type } ---
-const mediaCache = new Map();
+// --- 缓存 ---
+const mediaCache = new Map();   // id -> { url, sourceUrl, type }
+const previewCache = new Map(); // pageUrl -> { filePath, ready, clients[], error }
 let mediaId = 0;
 
 const cacheUrl = (url, sourceUrl, type = 'media') => {
     const id = ++mediaId;
     mediaCache.set(id, { url, sourceUrl, type });
-    setTimeout(() => mediaCache.delete(id), 3600000); // 1 小时后清理
+    setTimeout(() => mediaCache.delete(id), 3600000);
     return id;
+};
+
+// 清理过期预览文件（30 分钟后删）
+const cleanPreview = (filePath, delay = 1800000) => {
+    setTimeout(() => {
+        fs.unlink(filePath, () => {});
+    }, delay);
 };
 
 app.use(express.json());
@@ -100,8 +90,6 @@ app.post('/api/parse', async (req, res) => {
     if (!isValidUrl(url)) return res.status(400).json({ success: false, message: '链接格式无效，仅支持 http/https 链接' });
 
     try {
-        console.log(`[执行] 正在调用 yt-dlp...`);
-
         const ytdlpOptions = {
             dumpJson: true,
             noWarnings: true,
@@ -111,29 +99,23 @@ app.post('/api/parse', async (req, res) => {
         const isDouyin = /douyin\.com|iesdouyin\.com/.test(url);
         if (isDouyin) {
             const cookiesPath = path.join(__dirname, 'cookies.txt');
-            if (fs.existsSync(cookiesPath)) {
-                ytdlpOptions.cookies = cookiesPath;
-            } else {
-                ytdlpOptions.cookiesFromBrowser = 'chrome';
-            }
+            if (fs.existsSync(cookiesPath)) ytdlpOptions.cookies = cookiesPath;
+            else ytdlpOptions.cookiesFromBrowser = 'chrome';
         }
 
         const metadata = await youtubedl(url, ytdlpOptions);
         console.log(`[成功] 解析完成: ${metadata.title}`);
 
-        // 提取视频直链
+        // 提取视频直链（用于图片展示等，视频预览走 /api/preview）
         let videoUrl = metadata.url || '';
         if (!videoUrl && metadata.requested_formats && metadata.requested_formats.length > 0) {
-            const videoFormat = metadata.requested_formats.find(f => f.vcodec && f.vcodec !== 'none');
-            videoUrl = videoFormat ? videoFormat.url : metadata.requested_formats[0].url;
+            const vf = metadata.requested_formats.find(f => f.vcodec && f.vcodec !== 'none');
+            videoUrl = vf ? vf.url : metadata.requested_formats[0].url;
         }
         if (!videoUrl && metadata.formats && metadata.formats.length > 0) {
             for (let i = metadata.formats.length - 1; i >= 0; i--) {
                 const f = metadata.formats[i];
-                if (f.url && f.vcodec && f.vcodec !== 'none') {
-                    videoUrl = f.url;
-                    break;
-                }
+                if (f.url && f.vcodec && f.vcodec !== 'none') { videoUrl = f.url; break; }
             }
             if (!videoUrl) videoUrl = metadata.formats[metadata.formats.length - 1].url || '';
         }
@@ -142,7 +124,7 @@ app.post('/api/parse', async (req, res) => {
         const imageExts = ['jpg', 'jpeg', 'png', 'webp', 'gif'];
         const isVideo = !(metadata.entries && metadata.entries.length > 0) && !imageExts.includes(metadata.ext);
 
-        // 构建 mediaList（原始 URL）
+        // 构建 mediaList
         let rawMediaList = [];
         if (metadata.entries && metadata.entries.length > 0) {
             rawMediaList = metadata.entries.map(entry => entry.url || entry.thumbnail).filter(Boolean);
@@ -150,11 +132,18 @@ app.post('/api/parse', async (req, res) => {
             rawMediaList = [videoUrl];
         }
 
-        // 将所有媒体 URL 转为代理 URL（解决 CDN IP 锁定问题）
-        const proxyMediaList = rawMediaList.map(rawUrl => {
-            const id = cacheUrl(rawUrl, url, isVideo ? 'video' : 'image');
-            return `/api/stream/${id}`;
-        });
+        // 图片走代理，视频预览走专用接口
+        let proxyMediaList;
+        if (isVideo) {
+            // 视频：预览走 /api/preview?url=原始页面URL
+            proxyMediaList = [`/api/preview?url=${encodeURIComponent(url)}`];
+        } else {
+            // 图片：走 stream 代理
+            proxyMediaList = rawMediaList.map(rawUrl => {
+                const id = cacheUrl(rawUrl, url, 'image');
+                return `/api/stream/${id}`;
+            });
+        }
 
         // 封面代理
         let rawCover = metadata.thumbnail || '';
@@ -166,7 +155,6 @@ app.post('/api/parse', async (req, res) => {
             const id = cacheUrl(rawCover, url, 'image');
             cover = `/api/stream/${id}?t=${Date.now()}`;
         }
-        console.log(`[封面] 原始URL: ${rawCover ? rawCover.substring(0, 80) + '...' : '无'}`);
 
         res.json({
             success: true,
@@ -176,7 +164,8 @@ app.post('/api/parse', async (req, res) => {
                 videoUrl: proxyMediaList.length > 0 ? proxyMediaList[0] : '',
                 platform: metadata.extractor_key || 'Unknown',
                 isVideo: isVideo,
-                mediaList: proxyMediaList
+                mediaList: proxyMediaList,
+                pageUrl: url  // 原始页面 URL，前端下载用
             }
         });
 
@@ -187,91 +176,171 @@ app.post('/api/parse', async (req, res) => {
     }
 });
 
-// --- 统一媒体代理接口（封面 + 视频预览 + 图片都走这里）---
+// --- 视频预览接口（yt-dlp 下载临时文件，sendFile 自动支持 Range/206）---
+app.get('/api/preview', (req, res) => {
+    const pageUrl = req.query.url;
+    if (!pageUrl || !isValidUrl(pageUrl)) {
+        return res.status(400).send('无效链接');
+    }
+
+    // 检查是否已有缓存的预览文件
+    const cached = previewCache.get(pageUrl);
+    if (cached && cached.ready && fs.existsSync(cached.filePath)) {
+        console.log(`[预览] 使用缓存: ${cached.filePath}`);
+        return res.sendFile(cached.filePath);
+    }
+
+    // 如果正在下载中，等待完成
+    if (cached && !cached.ready && !cached.error) {
+        console.log(`[预览] 正在下载中，等待...`);
+        cached.clients.push(res);
+        return;
+    }
+
+    // 开始新的下载
+    const tmpFile = path.join(os.tmpdir(), `preview_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
+    const entry = { filePath: tmpFile, ready: false, clients: [res], error: null };
+    previewCache.set(pageUrl, entry);
+
+    console.log(`[预览] 开始下载: ${pageUrl.substring(0, 60)}...`);
+
+    const args = [
+        pageUrl,
+        '-f', 'bestvideo[vcodec^=avc1][height<=720]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc][height<=720]+bestaudio/best[height<=720]/bestvideo[vcodec^=avc1]+bestaudio/best',
+        '--merge-output-format', 'mp4',
+        '--remux-video', 'mp4',
+        '--no-warnings',
+        '--no-playlist',
+        '-o', tmpFile
+    ];
+    if (ffmpegDir) args.push('--ffmpeg-location', ffmpegDir);
+
+    // 抖音加 cookies
+    if (/douyin\.com|iesdouyin\.com/.test(pageUrl)) {
+        const cookiesPath = path.join(__dirname, 'cookies.txt');
+        if (fs.existsSync(cookiesPath)) args.push('--cookies', cookiesPath);
+        else args.push('--cookies-from-browser', 'chrome');
+    }
+
+    const child = spawn(ytdlpPath, args);
+
+    child.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg) console.log('[预览 yt-dlp]', msg);
+    });
+
+    child.on('error', (err) => {
+        console.error('[预览进程错误]', err.message);
+        entry.error = err.message;
+        entry.clients.forEach(c => { if (!c.headersSent) c.status(500).send('预览失败'); });
+        entry.clients = [];
+        previewCache.delete(pageUrl);
+        fs.unlink(tmpFile, () => {});
+    });
+
+    child.on('close', (code) => {
+        if (code !== 0) {
+            console.error('[预览] yt-dlp 退出码:', code);
+            entry.clients.forEach(c => { if (!c.headersSent) c.status(500).send('预览失败'); });
+            entry.clients = [];
+            previewCache.delete(pageUrl);
+            fs.unlink(tmpFile, () => {});
+            return;
+        }
+
+        // 查找实际文件（yt-dlp 可能改后缀）
+        let actualFile = tmpFile;
+        if (!fs.existsSync(actualFile)) {
+            const dir = path.dirname(tmpFile);
+            const base = path.basename(tmpFile, '.mp4');
+            const files = fs.readdirSync(dir).filter(f => f.startsWith(base));
+            if (files.length > 0) {
+                actualFile = path.join(dir, files[0]);
+            } else {
+                entry.clients.forEach(c => { if (!c.headersSent) c.status(500).send('预览文件未生成'); });
+                entry.clients = [];
+                previewCache.delete(pageUrl);
+                return;
+            }
+        }
+
+        const sizeMB = (fs.statSync(actualFile).size / 1024 / 1024).toFixed(1);
+        console.log(`[预览] 下载完成: ${sizeMB}MB -> ${actualFile}`);
+
+        entry.filePath = actualFile;
+        entry.ready = true;
+
+        // 向所有等待的客户端发送文件
+        entry.clients.forEach(c => {
+            if (!c.headersSent) c.sendFile(actualFile);
+        });
+        entry.clients = [];
+
+        // 30 分钟后清理
+        cleanPreview(actualFile);
+        setTimeout(() => previewCache.delete(pageUrl), 1800000);
+    });
+
+    // 客户端断开时从等待列表移除
+    res.on('close', () => {
+        entry.clients = entry.clients.filter(c => c !== res);
+        // 如果所有客户端都断开了且还没下完，杀进程
+        if (entry.clients.length === 0 && !entry.ready) {
+            if (!child.killed) child.kill();
+            previewCache.delete(pageUrl);
+            fs.unlink(tmpFile, () => {});
+        }
+    });
+});
+
+// --- 图片/封面代理接口 ---
 app.get('/api/stream/:id', async (req, res) => {
     const id = parseInt(req.params.id);
     const entry = mediaCache.get(id);
-    if (!entry) {
-        return res.redirect('/placeholder.svg');
-    }
+    if (!entry) return res.redirect('/placeholder.svg');
 
     const targetUrl = entry.url;
     if (!targetUrl) return res.redirect('/placeholder.svg');
 
-    const headers = proxyHeaders(targetUrl);
-
-    // 支持 Range 请求（视频拖动进度条）
-    if (req.headers.range) {
-        headers['Range'] = req.headers.range;
-    }
+    const referer = guessReferer(targetUrl);
+    const headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'image/avif,image/webp,image/*,*/*;q=0.8',
+        ...(referer ? { 'Referer': referer } : {})
+    };
 
     try {
         const response = await axios({
-            method: 'GET',
-            url: targetUrl,
-            responseType: 'stream',
-            timeout: 30000,
-            maxRedirects: 5,
-            headers: headers
+            method: 'GET', url: targetUrl, responseType: 'stream',
+            timeout: 15000, maxRedirects: 5, headers
         });
-
-        // 透传响应头
-        const ct = response.headers['content-type'] || (entry.type === 'video' ? 'video/mp4' : 'image/jpeg');
+        const ct = response.headers['content-type'] || 'image/jpeg';
         res.setHeader('Content-Type', ct);
-        res.setHeader('Accept-Ranges', 'bytes');
-        if (response.headers['content-length']) {
-            res.setHeader('Content-Length', response.headers['content-length']);
-        }
-        if (response.headers['content-range']) {
-            res.setHeader('Content-Range', response.headers['content-range']);
-            res.status(206);
-        }
-        // 允许缓存
-        res.setHeader('Cache-Control', 'public, max-age=1800');
-
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        if (response.headers['content-length']) res.setHeader('Content-Length', response.headers['content-length']);
         response.data.pipe(res);
-
-        response.data.on('error', () => {
-            if (!res.headersSent) res.redirect('/placeholder.svg');
-        });
-
     } catch (err) {
-        console.error(`[代理报错] ${entry.type}`, targetUrl.substring(0, 60), err.message);
-        // 重试一次（不带 Referer）
+        console.error('[图片代理报错]', targetUrl.substring(0, 60), err.message);
+        // 不带 Referer 重试
         try {
-            const retryHeaders = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': '*/*'
-            };
-            if (req.headers.range) retryHeaders['Range'] = req.headers.range;
-
             const retry = await axios({
-                method: 'GET',
-                url: targetUrl,
-                responseType: 'stream',
-                timeout: 30000,
-                maxRedirects: 5,
-                headers: retryHeaders
+                method: 'GET', url: targetUrl, responseType: 'stream',
+                timeout: 15000, maxRedirects: 5,
+                headers: { 'User-Agent': headers['User-Agent'], 'Accept': 'image/*,*/*;q=0.8' }
             });
-            const ct = retry.headers['content-type'] || 'application/octet-stream';
+            const ct = retry.headers['content-type'] || 'image/jpeg';
             res.setHeader('Content-Type', ct);
             if (retry.headers['content-length']) res.setHeader('Content-Length', retry.headers['content-length']);
-            if (retry.headers['content-range']) { res.setHeader('Content-Range', retry.headers['content-range']); res.status(206); }
             retry.data.pipe(res);
-        } catch (retryErr) {
-            console.error('[代理重试也失败]', retryErr.message);
-            if (!res.headersSent) {
-                if (entry.type === 'image') res.redirect('/placeholder.svg');
-                else res.status(502).send('媒体加载失败');
-            }
+        } catch {
+            if (!res.headersSent) res.redirect('/placeholder.svg');
         }
     }
 });
 
-// --- 下载接口（使用 yt-dlp 下载到临时文件）---
+// --- 下载接口 ---
 app.get('/api/download', (req, res) => {
     const { pageUrl, title } = req.query;
-
     if (!pageUrl) return res.status(400).send('缺少下载链接');
 
     const decodedUrl = decodeURIComponent(pageUrl);
@@ -280,49 +349,34 @@ app.get('/api/download', (req, res) => {
     const safeTitle = (title || 'download').replace(/[^a-zA-Z0-9\u4e00-\u9fa5_\-]/g, '_');
     console.log(`[下载] ${safeTitle} <- ${decodedUrl.substring(0, 80)}...`);
 
-    const os = require('os');
-    const tmpFile = path.join(os.tmpdir(), `vp_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
+    const tmpFile = path.join(os.tmpdir(), `dl_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
 
-    const { spawn } = require('child_process');
     const args = [
         decodedUrl,
-        // 格式选择：优先 H.264+音频合并，回退到任意视频+音频，再回退到最佳单文件
         '-f', 'bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc]+bestaudio/bestvideo+bestaudio/best',
         '--merge-output-format', 'mp4',
         '--remux-video', 'mp4',
-        '--ffmpeg-location', ffmpegPath.includes('/') ? path.dirname(ffmpegPath) : ffmpegPath,
-        '--postprocessor-args', 'ffmpeg:-movflags +faststart',
         '--no-warnings',
         '--no-playlist',
-        '--verbose',
         '-o', tmpFile
     ];
-
-    // 抖音加 cookies
-    const isDouyin = /douyin\.com|iesdouyin\.com/.test(decodedUrl);
-    if (isDouyin) {
-        const cookiesPath = path.join(__dirname, 'cookies.txt');
-        if (fs.existsSync(cookiesPath)) {
-            args.push('--cookies', cookiesPath);
-        } else {
-            args.push('--cookies-from-browser', 'chrome');
-        }
+    if (ffmpegDir) {
+        args.push('--ffmpeg-location', ffmpegDir);
+        args.push('--postprocessor-args', 'ffmpeg:-movflags +faststart');
     }
 
-    console.log(`[下载] yt-dlp 参数:`, args.join(' '));
+    if (/douyin\.com|iesdouyin\.com/.test(decodedUrl)) {
+        const cookiesPath = path.join(__dirname, 'cookies.txt');
+        if (fs.existsSync(cookiesPath)) args.push('--cookies', cookiesPath);
+        else args.push('--cookies-from-browser', 'chrome');
+    }
 
+    console.log(`[下载] 参数: yt-dlp ${args.join(' ')}`);
     const child = spawn(ytdlpPath, args);
 
     let stderrLog = '';
-    child.stdout.on('data', (data) => {
-        const msg = data.toString().trim();
-        if (msg) console.log('[下载 stdout]', msg);
-    });
-    child.stderr.on('data', (data) => {
-        const msg = data.toString().trim();
-        stderrLog += msg + '\n';
-        if (msg) console.log('[下载 stderr]', msg);
-    });
+    child.stdout.on('data', d => { const m = d.toString().trim(); if (m) console.log('[下载 out]', m); });
+    child.stderr.on('data', d => { const m = d.toString().trim(); stderrLog += m + '\n'; if (m) console.log('[下载 err]', m); });
 
     child.on('error', (err) => {
         console.error('[下载进程错误]', err.message);
@@ -332,51 +386,35 @@ app.get('/api/download', (req, res) => {
 
     child.on('close', (code) => {
         if (code !== 0) {
-            console.error('[下载] yt-dlp 退出码:', code);
-            console.error('[下载] 错误日志:', stderrLog.substring(0, 500));
+            console.error('[下载] 退出码:', code, stderrLog.substring(0, 300));
             fs.unlink(tmpFile, () => {});
             if (!res.headersSent) return res.status(500).send('下载失败');
             return;
         }
 
-        // yt-dlp 可能会自动加后缀，查找实际文件
         let actualFile = tmpFile;
         if (!fs.existsSync(actualFile)) {
             const dir = path.dirname(tmpFile);
             const base = path.basename(tmpFile, '.mp4');
             const files = fs.readdirSync(dir).filter(f => f.startsWith(base));
-            if (files.length > 0) {
-                actualFile = path.join(dir, files[0]);
-            } else {
-                console.error('[下载] 找不到输出文件, tmpFile=', tmpFile);
-                if (!res.headersSent) res.status(500).send('下载失败：文件未生成');
-                return;
-            }
+            if (files.length > 0) actualFile = path.join(dir, files[0]);
+            else { if (!res.headersSent) res.status(500).send('下载失败：文件未生成'); return; }
         }
 
         const stat = fs.statSync(actualFile);
-        const sizeMB = (stat.size / 1024 / 1024).toFixed(1);
-        console.log(`[下载] 完成，文件大小: ${sizeMB}MB, 路径: ${actualFile}`);
+        console.log(`[下载] 完成: ${(stat.size / 1024 / 1024).toFixed(1)}MB`);
 
-        // 根据实际文件扩展名设置正确的 Content-Type
-        const ext = path.extname(actualFile).toLowerCase();
-        const mimeMap = { '.mp4': 'video/mp4', '.webm': 'video/webm', '.mkv': 'video/x-matroska', '.m4a': 'audio/mp4' };
-        const contentType = mimeMap[ext] || 'video/mp4';
-
-        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeTitle)}${ext || '.mp4'}"`);
-        res.setHeader('Content-Type', contentType);
+        const ext = path.extname(actualFile).toLowerCase() || '.mp4';
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeTitle)}${ext}"`);
+        res.setHeader('Content-Type', 'video/mp4');
         res.setHeader('Content-Length', stat.size);
 
         const stream = fs.createReadStream(actualFile);
         stream.pipe(res);
         stream.on('end', () => fs.unlink(actualFile, () => {}));
-        stream.on('error', () => {
-            fs.unlink(actualFile, () => {});
-            if (!res.headersSent) res.status(500).send('下载失败');
-        });
+        stream.on('error', () => { fs.unlink(actualFile, () => {}); if (!res.headersSent) res.status(500).send('下载失败'); });
     });
 
-    // 用户断开连接时终止 yt-dlp 进程并清理
     res.on('close', () => {
         if (!child.killed) child.kill();
         setTimeout(() => fs.unlink(tmpFile, () => {}), 5000);
@@ -384,6 +422,5 @@ app.get('/api/download', (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`[启动] 服务已启动，监听端口: ${PORT}`);
-    console.log(`[启动] 访问地址: http://localhost:${PORT}`);
+    console.log(`[启动] 服务已启动: http://localhost:${PORT}`);
 });
