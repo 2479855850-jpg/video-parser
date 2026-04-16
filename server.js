@@ -26,7 +26,7 @@ try {
 }
 console.log(`[配置] ffmpeg: ${ffmpegPath}`);
 
-// --- 工具 ---
+// --- 工具函数 ---
 const isValidUrl = (str) => {
     try { return ['http:', 'https:'].includes(new URL(str).protocol); }
     catch { return false; }
@@ -39,13 +39,13 @@ const friendlyError = (msg) => {
     if (/Private/i.test(msg)) return '该视频为私密视频，无法解析';
     if (/Unsupported URL/i.test(msg)) return '不支持该链接，请检查链接是否正确';
     if (/Unable to extract/i.test(msg)) return '无法解析该链接，可能链接已失效或平台不支持';
-    if (/No video could be found/i.test(msg)) return '未找到视频内容，该推文可能不包含视频';
-    if (/Got error code 401|Unauthorized/i.test(msg)) return '访问被拒绝（需登录），请稍后重试或换一个链接';
+    if (/No video could be found/i.test(msg)) return '未找到视频内容';
+    if (/Got error code 401|Unauthorized/i.test(msg)) return '访问被拒绝（需登录），请稍后重试';
     if (/403|Forbidden/i.test(msg)) return '访问被拒绝，请稍后重试';
     if (/404/.test(msg)) return '内容不存在 (404)';
     if (/timed?\s*out/i.test(msg)) return '请求超时，请检查网络后重试';
-    if (/empty.*response/i.test(msg)) return 'Instagram 需要登录才能访问，暂不支持解析私密内容';
-    if (/instagram.*API.*not.*granting/i.test(msg)) return 'Instagram 接口受限，请稍后重试';
+    if (/empty.*response/i.test(msg)) return 'Instagram 需要登录才能访问，暂不支持该平台';
+    if (/instagram/i.test(msg)) return 'Instagram 接口受限，暂不支持该平台';
     return '解析失败，请检查链接是否正确或稍后重试';
 };
 
@@ -60,11 +60,9 @@ const guessReferer = (url) => {
     } catch { return ''; }
 };
 
-// --- 缓存 ---
+// --- 图片缓存 ---
 const mediaCache = new Map();
-const previewCache = new Map();
 let mediaId = 0;
-
 const cacheUrl = (url, sourceUrl, type = 'media') => {
     const id = ++mediaId;
     mediaCache.set(id, { url, sourceUrl, type });
@@ -72,24 +70,31 @@ const cacheUrl = (url, sourceUrl, type = 'media') => {
     return id;
 };
 
-// 查找 yt-dlp 输出的最终合并文件（关键：忽略 .fXXX 的分片文件）
-const findOutputFile = (tmpFile) => {
-    // 最优先：合并后的输出文件就是 tmpFile 本身
-    if (fs.existsSync(tmpFile)) return tmpFile;
+// --- Chrome 检测 ---
+let hasChromeAvailable = false;
+try {
+    if (process.platform === 'darwin') {
+        fs.accessSync('/Applications/Google Chrome.app');
+        hasChromeAvailable = true;
+    } else if (process.platform === 'linux') {
+        execSync('which google-chrome || which chromium-browser || which chromium', { encoding: 'utf-8' });
+        hasChromeAvailable = true;
+    }
+} catch { hasChromeAvailable = false; }
+console.log(`[配置] Chrome 可用: ${hasChromeAvailable}`);
 
+// --- 文件查找 ---
+const findOutputFile = (tmpFile) => {
+    if (fs.existsSync(tmpFile)) return tmpFile;
     const dir = path.dirname(tmpFile);
     const base = path.basename(tmpFile, path.extname(tmpFile));
-    const allFiles = fs.readdirSync(dir).filter(f => f.startsWith(base));
-
+    let allFiles;
+    try { allFiles = fs.readdirSync(dir).filter(f => f.startsWith(base)); }
+    catch { return null; }
     if (allFiles.length === 0) return null;
-
-    // 优先选没有 .fXXX 后缀的（合并后的文件）
     const merged = allFiles.find(f => !f.match(/\.f\d+\./));
     if (merged) return path.join(dir, merged);
-
-    // 如果都是分片文件，选最大的（通常是视频）
-    let biggest = allFiles[0];
-    let biggestSize = 0;
+    let biggest = allFiles[0], biggestSize = 0;
     for (const f of allFiles) {
         try {
             const s = fs.statSync(path.join(dir, f)).size;
@@ -99,152 +104,190 @@ const findOutputFile = (tmpFile) => {
     return path.join(dir, biggest);
 };
 
-// 检测是否有 Chrome 浏览器可用（Docker 中没有）
-let hasChromeAvailable = false;
-try {
-    if (process.platform === 'darwin') {
-        fs.accessSync('/Applications/Google Chrome.app');
-        hasChromeAvailable = true;
-    } else if (process.platform === 'linux') {
-        execSync('which google-chrome || which chromium-browser || which chromium', { encoding: 'utf-8' });
-        hasChromeAvailable = true;
-    } else if (process.platform === 'win32') {
-        hasChromeAvailable = true; // Windows 一般有
-    }
-} catch { hasChromeAvailable = false; }
-console.log(`[配置] Chrome 可用: ${hasChromeAvailable}`);
-
-// 用 ffmpeg 探测文件信息（是否有视频、编码格式）
+// --- 视频探测 ---
 const probeFile = (filePath) => {
     try {
         const out = execSync(`"${ffmpegPath}" -i "${filePath}" 2>&1 || true`, { encoding: 'utf-8', timeout: 10000 });
         const hasVideo = /Stream.*Video:/i.test(out);
         const hasAudio = /Stream.*Audio:/i.test(out);
-        // 检测视频编码
         const codecMatch = out.match(/Stream.*Video:\s*(\w+)/i);
         const vcodec = codecMatch ? codecMatch[1].toLowerCase() : '';
         return { hasVideo, hasAudio, vcodec };
     } catch { return { hasVideo: false, hasAudio: false, vcodec: '' }; }
 };
 
-// 如果视频编码不是 h264，转码为 h264（iOS 兼容）
+// --- VP9/AV1 → H264 转码 ---
 const reencodeToH264 = (inputPath) => {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
         const info = probeFile(inputPath);
-        // 已经是 h264 或没有视频轨道，不需要转码
         if (!info.hasVideo || info.vcodec === 'h264' || info.vcodec === 'avc1' || info.vcodec === 'avc') {
             return resolve(inputPath);
         }
         console.log(`[转码] ${info.vcodec} -> h264: ${path.basename(inputPath)}`);
         const outPath = inputPath.replace(/(\.\w+)$/, '_h264$1');
-        const args = [
+        const child = spawn(ffmpegPath, [
             '-i', inputPath,
-            '-c:v', 'libx264',
-            '-preset', 'fast',
-            '-crf', '23',
-            '-c:a', 'aac',
-            '-b:a', '128k',
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
             '-movflags', '+faststart',
-            '-y',
-            outPath
-        ];
-        const child = spawn(ffmpegPath, args);
+            '-y', outPath
+        ]);
         let stderr = '';
         child.stderr.on('data', d => { stderr += d.toString(); });
-        child.on('error', err => {
-            console.error('[转码错误]', err.message);
-            resolve(inputPath); // 转码失败就用原文件
-        });
+        child.on('error', () => resolve(inputPath));
         child.on('close', code => {
             if (code === 0 && fs.existsSync(outPath)) {
-                const oldSize = fs.statSync(inputPath).size;
-                const newSize = fs.statSync(outPath).size;
-                console.log(`[转码] 完成: ${(oldSize/1048576).toFixed(1)}MB -> ${(newSize/1048576).toFixed(1)}MB`);
-                fs.unlink(inputPath, () => {}); // 删除原文件
+                console.log(`[转码] 完成: ${(fs.statSync(outPath).size/1048576).toFixed(1)}MB`);
+                fs.unlink(inputPath, () => {});
                 resolve(outPath);
             } else {
                 console.error('[转码] 失败:', stderr.substring(0, 200));
-                resolve(inputPath); // 转码失败就用原文件
+                if (fs.existsSync(outPath)) fs.unlink(outPath, () => {});
+                resolve(inputPath);
             }
         });
     });
 };
 
-// 通用 yt-dlp 下载参数
+// --- yt-dlp 参数 ---
 const buildYtdlpArgs = (url, outputPath, maxHeight, forceVideo = true) => {
     const args = [url];
-
     if (forceVideo) {
-        // 优先选 h264 编码（iOS 兼容），然后才选其他编码
         let hf = maxHeight ? `[height<=${maxHeight}]` : '';
         args.push('-f', [
-            // 第一优先：h264 视频 + aac 音频（最佳兼容性）
             `bv*${hf}[vcodec^=avc]+ba[ext=m4a]`,
             `bv*${hf}[vcodec^=avc]+ba`,
             `bv*${hf}[vcodec^=avc]`,
-            // 第二优先：h264 已合并格式
             `b${hf}[vcodec^=avc]`,
-            // 第三优先：任何有视频的格式（VP9/AV1 等，后续会转码）
             `bv*${hf}[vcodec!=none]+ba`,
             `bv*${hf}[vcodec!=none]`,
             `b${hf}[vcodec!=none]`,
             `b${hf}`
         ].join('/'));
     }
-
-    // 排序偏好 h264+aac+mp4
-    const sortParts = ['vcodec:h264', 'acodec:aac', 'ext:mp4:m4a'];
-    if (maxHeight) sortParts.push(`res:${maxHeight}`);
-    args.push('-S', sortParts.join(','));
-
-    args.push(
-        '--merge-output-format', 'mp4',
-        '--remux-video', 'mp4',
-        '--no-warnings',
-        '--no-playlist',
-        '-o', outputPath
-    );
-
-    // ffmpeg 位置
+    args.push('-S', ['vcodec:h264', 'acodec:aac', 'ext:mp4:m4a', ...(maxHeight ? [`res:${maxHeight}`] : [])].join(','));
+    args.push('--merge-output-format', 'mp4', '--remux-video', 'mp4', '--no-warnings', '--no-playlist', '-o', outputPath);
     if (ffmpegPath && ffmpegPath !== 'ffmpeg') {
         const dir = path.dirname(ffmpegPath);
         if (dir && dir !== '.') args.push('--ffmpeg-location', dir);
     }
-
-    // Cookies
     const cookiesPath = path.join(__dirname, 'cookies.txt');
-    const needsCookies = /douyin\.com|iesdouyin\.com|twitter\.com|x\.com|instagram\.com/.test(url);
-    if (needsCookies) {
-        if (fs.existsSync(cookiesPath)) {
-            args.push('--cookies', cookiesPath);
-        } else if (hasChromeAvailable) {
-            args.push('--cookies-from-browser', 'chrome');
-        }
+    if (/douyin\.com|iesdouyin\.com|twitter\.com|x\.com|instagram\.com/.test(url)) {
+        if (fs.existsSync(cookiesPath)) args.push('--cookies', cookiesPath);
+        else if (hasChromeAvailable) args.push('--cookies-from-browser', 'chrome');
     }
-
     return args;
 };
 
+// ===================================================================
+//  任务队列系统 — 解决 Render 30 秒超时 + 手机下载兼容性
+// ===================================================================
+const taskStore = new Map();
+let taskCounter = 0;
+
+const startTask = (url, type, maxHeight) => {
+    // 相同 URL + 类型 复用已有任务
+    for (const [id, t] of taskStore) {
+        if (t.url === url && t.type === type && t.status !== 'error') {
+            console.log(`[任务] 复用 ${id}`);
+            return id;
+        }
+    }
+
+    const taskId = `${++taskCounter}_${Date.now().toString(36)}`;
+    const tmpFile = path.join(os.tmpdir(), `task_${taskId}.mp4`);
+    const task = { url, type, status: 'downloading', file: null, error: null, tmpFile, created: Date.now() };
+    taskStore.set(taskId, task);
+
+    console.log(`[任务 ${taskId}] 开始 ${type}: ${url.substring(0, 80)}`);
+
+    const doAttempt = (attempt) => {
+        const currentTmp = attempt === 1 ? tmpFile : tmpFile.replace('.mp4', `_r${attempt}.mp4`);
+        const args = buildYtdlpArgs(url, currentTmp, maxHeight, attempt === 1);
+        const child = spawn(ytdlpPath, args);
+
+        let stderr = '';
+        child.stderr.on('data', d => { stderr += d.toString(); });
+        child.stdout.on('data', () => {});
+
+        child.on('error', err => {
+            console.error(`[任务 ${taskId}] spawn 错误:`, err.message);
+            task.status = 'error';
+            task.error = friendlyError(err.message);
+        });
+
+        child.on('close', code => {
+            if (code !== 0) {
+                if (attempt === 1) {
+                    console.log(`[任务 ${taskId}] 严格模式失败，宽松重试...`);
+                    return doAttempt(2);
+                }
+                task.status = 'error';
+                task.error = friendlyError(stderr);
+                console.error(`[任务 ${taskId}] 失败:`, stderr.substring(0, 300));
+                return;
+            }
+
+            const actualFile = findOutputFile(currentTmp);
+            if (!actualFile) {
+                if (attempt === 1) return doAttempt(2);
+                task.status = 'error';
+                task.error = '文件未生成';
+                return;
+            }
+
+            const info = probeFile(actualFile);
+            if (!info.hasVideo && attempt === 1) {
+                console.log(`[任务 ${taskId}] 纯音频，重试...`);
+                fs.unlink(actualFile, () => {});
+                return doAttempt(2);
+            }
+
+            // 转码（VP9 → H264）
+            task.status = 'transcoding';
+            reencodeToH264(actualFile).then(finalFile => {
+                task.file = finalFile;
+                task.status = 'done';
+                const size = (fs.statSync(finalFile).size / 1048576).toFixed(1);
+                console.log(`[任务 ${taskId}] 完成: ${size}MB`);
+            }).catch(() => {
+                task.file = actualFile;
+                task.status = 'done';
+            });
+        });
+    };
+
+    doAttempt(1);
+
+    // 30 分钟后清理
+    setTimeout(() => {
+        const t = taskStore.get(taskId);
+        if (t?.file && fs.existsSync(t.file)) fs.unlink(t.file, () => {});
+        taskStore.delete(taskId);
+        console.log(`[任务 ${taskId}] 已清理`);
+    }, 1800000);
+
+    return taskId;
+};
+
+// ===================================================================
+//  路由
+// ===================================================================
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// --- 解析接口 ---
+// --- 解析接口（不变）---
 app.post('/api/parse', async (req, res) => {
     const { url } = req.body;
     console.log(`[请求] ${url}`);
-
     if (!url) return res.status(400).json({ success: false, message: '提供链接为空' });
     if (!isValidUrl(url)) return res.status(400).json({ success: false, message: '链接格式无效' });
 
     try {
         const opts = {
-            dumpJson: true,
-            noWarnings: true,
-            noPlaylist: true,
+            dumpJson: true, noWarnings: true, noPlaylist: true,
             addHeader: ['User-Agent:Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36']
         };
-
-        // 需要 cookies 的平台
         if (/douyin\.com|iesdouyin\.com|twitter\.com|x\.com|instagram\.com/.test(url)) {
             const cp = path.join(__dirname, 'cookies.txt');
             if (fs.existsSync(cp)) opts.cookies = cp;
@@ -254,7 +297,6 @@ app.post('/api/parse', async (req, res) => {
         const metadata = await youtubedl(url, opts);
         console.log(`[成功] ${metadata.title}`);
 
-        // 提取视频直链
         let videoUrl = metadata.url || '';
         if (!videoUrl && metadata.requested_formats?.length > 0) {
             const vf = metadata.requested_formats.find(f => f.vcodec && f.vcodec !== 'none');
@@ -278,10 +320,9 @@ app.post('/api/parse', async (req, res) => {
             rawMediaList = [videoUrl];
         }
 
-        // 视频走专用预览接口，图片走代理
         let proxyMediaList;
         if (isVideo) {
-            proxyMediaList = [`/api/preview?url=${encodeURIComponent(url)}`];
+            proxyMediaList = []; // 前端用任务系统加载预览
         } else {
             proxyMediaList = rawMediaList.map(u => {
                 const id = cacheUrl(u, url, 'image');
@@ -289,7 +330,6 @@ app.post('/api/parse', async (req, res) => {
             });
         }
 
-        // 封面
         let rawCover = metadata.thumbnail || '';
         if (!rawCover && metadata.thumbnails?.length > 0) {
             rawCover = metadata.thumbnails[metadata.thumbnails.length - 1].url || '';
@@ -305,7 +345,6 @@ app.post('/api/parse', async (req, res) => {
             data: {
                 title: metadata.title || '未知标题',
                 cover,
-                videoUrl: proxyMediaList[0] || '',
                 platform: metadata.extractor_key || 'Unknown',
                 isVideo,
                 mediaList: proxyMediaList,
@@ -318,82 +357,6 @@ app.post('/api/parse', async (req, res) => {
         console.error(`[报错]`, rawMsg.substring(0, 200));
         res.status(500).json({ success: false, message: friendlyError(rawMsg) });
     }
-});
-
-// --- 视频预览（yt-dlp 下载到临时文件，sendFile 完美支持 iOS Range 请求）---
-app.get('/api/preview', (req, res) => {
-    const pageUrl = req.query.url;
-    if (!pageUrl || !isValidUrl(pageUrl)) return res.status(400).send('无效链接');
-
-    const cached = previewCache.get(pageUrl);
-    if (cached?.ready && fs.existsSync(cached.filePath)) {
-        return res.sendFile(cached.filePath);
-    }
-    if (cached && !cached.ready && !cached.error) {
-        cached.clients.push(res);
-        return;
-    }
-
-    const tmpFile = path.join(os.tmpdir(), `pv_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
-    const entry = { filePath: tmpFile, ready: false, clients: [res], error: null };
-    previewCache.set(pageUrl, entry);
-
-    console.log(`[预览] 下载: ${pageUrl.substring(0, 60)}...`);
-    const args = buildYtdlpArgs(pageUrl, tmpFile, 720, true);
-    const child = spawn(ytdlpPath, args);
-
-    let stderrBuf = '';
-    child.stderr.on('data', d => { stderrBuf += d.toString(); });
-    child.stdout.on('data', d => {});
-
-    child.on('error', err => {
-        console.error('[预览错误]', err.message);
-        entry.clients.forEach(c => { if (!c.headersSent) c.status(500).send('预览失败'); });
-        entry.clients = [];
-        previewCache.delete(pageUrl);
-        fs.unlink(tmpFile, () => {});
-    });
-
-    child.on('close', code => {
-        if (code !== 0) {
-            console.error('[预览] 失败:', stderrBuf.substring(0, 200));
-            entry.clients.forEach(c => { if (!c.headersSent) c.status(500).send('预览失败'); });
-            entry.clients = [];
-            previewCache.delete(pageUrl);
-            fs.unlink(tmpFile, () => {});
-            return;
-        }
-
-        let actualFile = findOutputFile(tmpFile);
-        if (!actualFile) {
-            entry.clients.forEach(c => { if (!c.headersSent) c.status(500).send('预览文件未生成'); });
-            entry.clients = [];
-            previewCache.delete(pageUrl);
-            return;
-        }
-
-        const sizeMB = (fs.statSync(actualFile).size / 1024 / 1024).toFixed(1);
-        console.log(`[预览] 下载完成: ${sizeMB}MB，检查编码...`);
-
-        // 如果不是 h264，转码为 h264（确保 iOS 能播放）
-        reencodeToH264(actualFile).then(finalFile => {
-            entry.filePath = finalFile;
-            entry.ready = true;
-            entry.clients.forEach(c => { if (!c.headersSent) c.sendFile(finalFile); });
-            entry.clients = [];
-            // 30 分钟后清理
-            setTimeout(() => { fs.unlink(finalFile, () => {}); previewCache.delete(pageUrl); }, 1800000);
-        });
-    });
-
-    res.on('close', () => {
-        entry.clients = entry.clients.filter(c => c !== res);
-        if (entry.clients.length === 0 && !entry.ready) {
-            if (!child.killed) child.kill();
-            previewCache.delete(pageUrl);
-            fs.unlink(tmpFile, () => {});
-        }
-    });
 });
 
 // --- 图片/封面代理 ---
@@ -424,95 +387,37 @@ app.get('/api/stream/:id', async (req, res) => {
     }
 });
 
-// --- 下载接口 ---
-app.get('/api/download', (req, res) => {
-    const { pageUrl, title } = req.query;
-    if (!pageUrl) return res.status(400).send('缺少下载链接');
+// --- 任务系统接口 ---
 
-    const decodedUrl = decodeURIComponent(pageUrl);
-    if (!isValidUrl(decodedUrl)) return res.status(400).send('链接格式无效');
+// POST /api/prepare — 启动下载/预览任务，立即返回任务 ID（不阻塞）
+app.post('/api/prepare', (req, res) => {
+    const { url, type } = req.body;
+    if (!url || !isValidUrl(url)) return res.status(400).json({ error: '无效链接' });
+    const maxHeight = type === 'preview' ? 720 : null;
+    const taskId = startTask(url, type || 'download', maxHeight);
+    res.json({ taskId });
+});
 
-    const safeTitle = (title || 'download').replace(/[^a-zA-Z0-9\u4e00-\u9fa5_\-]/g, '_');
-    console.log(`[下载] ${safeTitle} <- ${decodedUrl.substring(0, 60)}...`);
+// GET /api/task/:id — 查询任务状态（前端轮询）
+app.get('/api/task/:id', (req, res) => {
+    const task = taskStore.get(req.params.id);
+    if (!task) return res.status(404).json({ status: 'error', error: '任务不存在或已过期' });
+    res.json({ status: task.status, error: task.error });
+});
 
-    // 实际下载逻辑（支持重试）
-    const doDownload = (attempt) => {
-        const tmpFile = path.join(os.tmpdir(), `dl_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
-        // 第一次用严格模式（强制视频），失败后用宽松模式
-        const args = buildYtdlpArgs(decodedUrl, tmpFile, null, attempt === 1);
-
-        console.log(`[下载] 尝试 #${attempt}, yt-dlp args:`, args.slice(1).join(' '));
-        const child = spawn(ytdlpPath, args);
-
-        let stderrBuf = '';
-        child.stdout.on('data', d => { console.log('[下载 stdout]', d.toString().trim()); });
-        child.stderr.on('data', d => { const m = d.toString(); stderrBuf += m; });
-
-        child.on('error', err => {
-            console.error('[下载错误]', err.message);
-            fs.unlink(tmpFile, () => {});
-            if (!res.headersSent) res.status(500).send('下载失败');
-        });
-
-        child.on('close', code => {
-            if (code !== 0) {
-                console.error(`[下载] 尝试 #${attempt} 失败:`, stderrBuf.substring(0, 300));
-                // 如果严格视频模式失败（没有视频格式匹配），用宽松模式重试
-                if (attempt === 1) {
-                    console.log('[下载] 严格视频模式失败，用宽松模式重试...');
-                    fs.unlink(tmpFile, () => {});
-                    return doDownload(2);
-                }
-                fs.unlink(tmpFile, () => {});
-                if (!res.headersSent) return res.status(500).send('下载失败');
-                return;
-            }
-
-            const actualFile = findOutputFile(tmpFile);
-            if (!actualFile) {
-                console.error('[下载] 找不到输出文件');
-                if (attempt === 1) { fs.unlink(tmpFile, () => {}); return doDownload(2); }
-                if (!res.headersSent) res.status(500).send('下载失败：文件未生成');
-                return;
-            }
-
-            const info = probeFile(actualFile);
-            const sizeMB = (fs.statSync(actualFile).size / 1048576).toFixed(1);
-            console.log(`[下载] 尝试 #${attempt} 完成: ${sizeMB}MB, 含视频=${info.hasVideo}, 编码=${info.vcodec}`);
-
-            // 第一次下载得到纯音频 → 宽松模式重试
-            if (!info.hasVideo && attempt === 1) {
-                console.log('[下载] 输出是纯音频，用宽松模式重试...');
-                fs.unlink(actualFile, () => {});
-                return doDownload(2);
-            }
-
-            // 如果不是 h264，转码为 h264（确保手机能播放）
-            const sendFile = (filePath) => {
-                const stat = fs.statSync(filePath);
-                const ext = path.extname(filePath).toLowerCase() || '.mp4';
-                res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeTitle)}${ext}"`);
-                res.setHeader('Content-Type', 'video/mp4');
-                res.setHeader('Content-Length', stat.size);
-                const stream = fs.createReadStream(filePath);
-                stream.pipe(res);
-                stream.on('end', () => fs.unlink(filePath, () => {}));
-                stream.on('error', () => { fs.unlink(filePath, () => {}); if (!res.headersSent) res.status(500).send('下载失败'); });
-            };
-
-            reencodeToH264(actualFile).then(finalFile => {
-                if (res.headersSent) { fs.unlink(finalFile, () => {}); return; }
-                sendFile(finalFile);
-            });
-        });
-
-        res.on('close', () => {
-            if (!child.killed) child.kill();
-            setTimeout(() => fs.unlink(tmpFile, () => {}), 5000);
-        });
-    };
-
-    doDownload(1);
+// GET /api/file/:id — 获取已完成的文件（支持 Range / iOS 视频）
+app.get('/api/file/:id', (req, res) => {
+    const task = taskStore.get(req.params.id);
+    if (!task || task.status !== 'done' || !task.file || !fs.existsSync(task.file)) {
+        return res.status(404).send('文件未就绪');
+    }
+    if (req.query.download === '1') {
+        const title = req.query.title || 'download';
+        const safeTitle = title.replace(/[^a-zA-Z0-9\u4e00-\u9fa5_\-]/g, '_');
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeTitle)}.mp4"`);
+    }
+    res.setHeader('Content-Type', 'video/mp4');
+    res.sendFile(task.file); // sendFile 自动支持 Range 206
 });
 
 app.listen(PORT, () => console.log(`[启动] http://localhost:${PORT}`));

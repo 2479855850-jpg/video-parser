@@ -849,7 +849,6 @@
 
     <!-- Hidden -->
     <div id="current-page-url" style="display:none;"></div>
-    <iframe id="download-iframe" style="display:none;" name="download_iframe"></iframe>
 
     <script>
         // --- DOM ---
@@ -953,6 +952,8 @@
             document.getElementById('back-text').textContent = currentLang === 'zh' ? '返回' : 'Back';
         };
         const closeModal = () => {
+            // 停止轮询
+            if (previewPollTimer) { clearTimeout(previewPollTimer); previewPollTimer = null; }
             // 停止视频播放
             const v = modalContent.querySelector('video');
             if (v) { v.pause(); v.src = ''; }
@@ -961,42 +962,67 @@
             document.body.style.overflow = '';
         };
 
-        const renderModalContent = () => {
-            modalContent.innerHTML = '';
-            if (isCurrentVideo) {
-                galleryControls.classList.remove('visible');
-                // 显示加载提示（服务器需要先下载视频）
-                modalContent.innerHTML = `
-                    <div id="video-loading" style="display:flex;flex-direction:column;align-items:center;justify-content:center;width:100%;min-height:200px;color:rgba(255,255,255,0.5);gap:12px;">
-                        <div class="loading-dots" style="transform:scale(1.5);"><span></span><span></span><span></span></div>
-                        <div style="font-size:13px;">${currentLang === 'zh' ? '正在加载视频，请稍候...' : 'Loading video, please wait...'}</div>
-                    </div>
-                    <video src="${currentMediaList[0]}" controls autoplay playsinline webkit-playsinline controlsList="nodownload" preload="auto" style="display:none;width:100%;max-height:80vh;border-radius:16px;outline:none;background:#000;"></video>
-                `;
-                const videoEl = modalContent.querySelector('video');
-                const loadingEl = document.getElementById('video-loading');
-                videoEl.addEventListener('canplay', () => {
-                    if (loadingEl) loadingEl.style.display = 'none';
-                    videoEl.style.display = 'block';
-                });
-                videoEl.addEventListener('error', () => {
-                    if (loadingEl) loadingEl.innerHTML = `<div style="font-size:14px;color:#f87171;">${currentLang === 'zh' ? '视频加载失败，请尝试直接下载' : 'Video load failed, try downloading instead'}</div>`;
-                });
+        // 图片画廊渲染
+        const renderGalleryContent = () => {
+            modalContent.innerHTML = `<img src="${currentMediaList[currentIndex]}" />`;
+            if (currentMediaList.length > 1) {
+                galleryControls.classList.add('visible');
+                document.getElementById('gallery-indicator').textContent = `${currentIndex + 1} / ${currentMediaList.length}`;
             } else {
-                modalContent.innerHTML = `<img src="${currentMediaList[currentIndex]}" />`;
-                if (currentMediaList.length > 1) {
-                    galleryControls.classList.add('visible');
-                    document.getElementById('gallery-indicator').textContent = `${currentIndex + 1} / ${currentMediaList.length}`;
-                } else {
-                    galleryControls.classList.remove('visible');
-                }
+                galleryControls.classList.remove('visible');
+            }
+        };
+
+        // 视频预览（任务队列）
+        let previewPollTimer = null;
+        const startVideoPreview = async (pageUrl) => {
+            galleryControls.classList.remove('visible');
+            modalContent.innerHTML = `
+                <div id="video-loading" style="display:flex;flex-direction:column;align-items:center;justify-content:center;width:100%;min-height:200px;color:rgba(255,255,255,0.5);gap:12px;">
+                    <div class="loading-dots" style="transform:scale(1.5);"><span></span><span></span><span></span></div>
+                    <div id="loading-text" style="font-size:13px;">${currentLang === 'zh' ? '正在准备视频，请稍候...' : 'Preparing video, please wait...'}</div>
+                </div>
+            `;
+
+            try {
+                const resp = await fetch('/api/prepare', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: pageUrl, type: 'preview' })
+                });
+                const { taskId, error } = await resp.json();
+                if (error) throw new Error(error);
+
+                const poll = () => {
+                    fetch('/api/task/' + taskId).then(r => r.json()).then(data => {
+                        const loadingEl = document.getElementById('video-loading');
+                        if (!modal.classList.contains('visible')) return; // 用户已关闭
+
+                        if (data.status === 'done') {
+                            if (loadingEl) loadingEl.remove();
+                            modalContent.innerHTML = `<video src="/api/file/${taskId}" controls autoplay playsinline webkit-playsinline controlslist="nodownload" style="width:100%;max-height:80vh;border-radius:16px;outline:none;background:#000;"></video>`;
+                        } else if (data.status === 'error') {
+                            if (loadingEl) loadingEl.innerHTML = `<div style="font-size:14px;color:#f87171;text-align:center;padding:20px;">${data.error || (currentLang === 'zh' ? '视频加载失败' : 'Video load failed')}</div>`;
+                        } else {
+                            const textEl = document.getElementById('loading-text');
+                            if (textEl && data.status === 'transcoding') {
+                                textEl.textContent = currentLang === 'zh' ? '正在转码视频...' : 'Transcoding...';
+                            }
+                            previewPollTimer = setTimeout(poll, 2000);
+                        }
+                    }).catch(() => { previewPollTimer = setTimeout(poll, 3000); });
+                };
+                previewPollTimer = setTimeout(poll, 1500);
+            } catch (err) {
+                const loadingEl = document.getElementById('video-loading');
+                if (loadingEl) loadingEl.innerHTML = `<div style="font-size:14px;color:#f87171;text-align:center;padding:20px;">${err.message || (currentLang === 'zh' ? '加载失败' : 'Load failed')}</div>`;
             }
         };
 
         closeModalBtn.addEventListener('click', closeModal);
         modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
-        document.getElementById('prev-img').addEventListener('click', () => { if (currentIndex > 0) { currentIndex--; renderModalContent(); } });
-        document.getElementById('next-img').addEventListener('click', () => { if (currentIndex < currentMediaList.length - 1) { currentIndex++; renderModalContent(); } });
+        document.getElementById('prev-img').addEventListener('click', () => { if (currentIndex > 0) { currentIndex--; renderGalleryContent(); } });
+        document.getElementById('next-img').addEventListener('click', () => { if (currentIndex < currentMediaList.length - 1) { currentIndex++; renderGalleryContent(); } });
 
         // --- Result Card ---
         const displayVideoInfo = (data) => {
@@ -1025,14 +1051,22 @@
             resultsContainer.appendChild(card);
 
             document.getElementById('preview-button').addEventListener('click', () => {
-                currentMediaList = mediaList && mediaList.length > 0 ? mediaList : [videoUrl];
-                isCurrentVideo = isVideo;
-                currentIndex = 0;
-                openModal();
-                renderModalContent();
+                const pageUrl = currentPageUrlStore.textContent;
+                if (isVideo && pageUrl) {
+                    isCurrentVideo = true;
+                    openModal();
+                    startVideoPreview(pageUrl);
+                } else {
+                    // 图片画廊
+                    currentMediaList = mediaList && mediaList.length > 0 ? mediaList : [];
+                    isCurrentVideo = false;
+                    currentIndex = 0;
+                    openModal();
+                    renderGalleryContent();
+                }
             });
 
-            document.getElementById('download-button').addEventListener('click', (e) => {
+            document.getElementById('download-button').addEventListener('click', async (e) => {
                 const btn = e.currentTarget;
                 const pageUrl = currentPageUrlStore.textContent;
                 if (!pageUrl) {
@@ -1040,11 +1074,58 @@
                     return;
                 }
                 btn.disabled = true;
-                btn.innerHTML = currentLang === 'zh' ? '下载中...' : 'Downloading...';
+                btn.innerHTML = currentLang === 'zh' ? '准备中...' : 'Preparing...';
                 const safeTitle = title.replace(/[^a-zA-Z0-9\u4e00-\u9fa5_\-]/g, '_') || 'download';
-                document.getElementById('download-iframe').src = `/api/download?pageUrl=${encodeURIComponent(pageUrl)}&title=${encodeURIComponent(safeTitle)}`;
-                // 下载需要服务器先用 yt-dlp 下载，可能需要较长时间
-                setTimeout(() => { if (btn.disabled) window.resetDownloadStatus(); }, 60000);
+
+                try {
+                    const resp = await fetch('/api/prepare', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ url: pageUrl, type: 'download' })
+                    });
+                    const { taskId, error } = await resp.json();
+                    if (error) throw new Error(error);
+
+                    const poll = async () => {
+                        try {
+                            const data = await fetch('/api/task/' + taskId).then(r => r.json());
+                            if (data.status === 'done') {
+                                btn.innerHTML = currentLang === 'zh' ? '下载中...' : 'Downloading...';
+                                // 用 fetch + blob 触发下载（兼容所有手机浏览器）
+                                const fileResp = await fetch('/api/file/' + taskId + '?download=1&title=' + encodeURIComponent(safeTitle));
+                                if (!fileResp.ok) throw new Error('下载失败');
+                                const blob = await fileResp.blob();
+                                const blobUrl = URL.createObjectURL(blob);
+                                const a = document.createElement('a');
+                                a.href = blobUrl;
+                                a.download = safeTitle + '.mp4';
+                                a.style.display = 'none';
+                                document.body.appendChild(a);
+                                a.click();
+                                document.body.removeChild(a);
+                                setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+                                btn.disabled = false;
+                                btn.innerHTML = translations[currentLang]['download-video'];
+                            } else if (data.status === 'error') {
+                                throw new Error(data.error || '下载失败');
+                            } else {
+                                btn.innerHTML = currentLang === 'zh'
+                                    ? (data.status === 'transcoding' ? '转码中...' : '准备中...')
+                                    : (data.status === 'transcoding' ? 'Transcoding...' : 'Preparing...');
+                                setTimeout(poll, 2000);
+                            }
+                        } catch (err) {
+                            btn.disabled = false;
+                            btn.innerHTML = translations[currentLang]['download-video'];
+                            alert(err.message || (currentLang === 'zh' ? '下载失败，请重试' : 'Download failed'));
+                        }
+                    };
+                    setTimeout(poll, 1500);
+                } catch (err) {
+                    btn.disabled = false;
+                    btn.innerHTML = translations[currentLang]['download-video'];
+                    alert(err.message || (currentLang === 'zh' ? '下载失败，请重试' : 'Download failed'));
+                }
             });
 
             updateAllText(currentLang);
