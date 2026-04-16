@@ -1,0 +1,7 @@
+node_modules
+server.log
+cookies.txt
+.DS_Store
+.env
+*.log
+.git

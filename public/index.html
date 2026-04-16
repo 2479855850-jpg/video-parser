@@ -1,0 +1,1136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>VideoParser - 全平台视频解析</title>
+    <meta name="description" content="支持 YouTube、Bilibili、Instagram、Twitter 等 1800+ 平台的视频解析下载工具">
+    <style>
+        /* ===== Reset & Base ===== */
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+        html { font-size: 16px; -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+            background: #0a0a0f;
+            color: #e4e4e7;
+            min-height: 100vh;
+            overflow-x: hidden;
+            line-height: 1.6;
+        }
+
+        /* ===== Animated Background ===== */
+        .bg-canvas {
+            position: fixed;
+            inset: 0;
+            z-index: -1;
+            overflow: hidden;
+        }
+        .bg-canvas::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(ellipse at 20% 50%, rgba(120, 80, 255, 0.08) 0%, transparent 50%),
+                        radial-gradient(ellipse at 80% 20%, rgba(255, 180, 50, 0.06) 0%, transparent 50%),
+                        radial-gradient(ellipse at 50% 80%, rgba(50, 180, 255, 0.05) 0%, transparent 50%);
+            animation: bgDrift 20s ease-in-out infinite alternate;
+        }
+        .bg-canvas::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background:
+                radial-gradient(circle at 30% 70%, rgba(120, 80, 255, 0.03) 0%, transparent 40%),
+                radial-gradient(circle at 70% 30%, rgba(255, 200, 50, 0.03) 0%, transparent 40%);
+            animation: bgDrift2 25s ease-in-out infinite alternate;
+        }
+        @keyframes bgDrift {
+            0% { transform: translate(0, 0) rotate(0deg); }
+            100% { transform: translate(3%, -2%) rotate(3deg); }
+        }
+        @keyframes bgDrift2 {
+            0% { transform: translate(0, 0) scale(1); }
+            100% { transform: translate(-2%, 3%) scale(1.05); }
+        }
+        /* Grid overlay */
+        .bg-grid {
+            position: fixed;
+            inset: 0;
+            z-index: -1;
+            background-image:
+                linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+            background-size: 60px 60px;
+        }
+
+        /* ===== Scrollbar ===== */
+        ::-webkit-scrollbar { width: 5px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+
+        /* ===== Animations ===== */
+        @keyframes fadeUp {
+            from { opacity: 0; transform: translateY(16px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes shake {
+            10%, 90% { transform: translateX(-1px); }
+            20%, 80% { transform: translateX(2px); }
+            30%, 50%, 70% { transform: translateX(-3px); }
+            40%, 60% { transform: translateX(3px); }
+        }
+        @keyframes pulse-ring {
+            0% { transform: scale(1); opacity: 1; }
+            100% { transform: scale(1.4); opacity: 0; }
+        }
+        @keyframes shimmer {
+            0% { background-position: -200% 0; }
+            100% { background-position: 200% 0; }
+        }
+        .animate-fade-up { animation: fadeUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+        .animate-shake { animation: shake 0.5s ease-in-out; }
+
+        /* ===== Glass Effect ===== */
+        .glass {
+            background: rgba(255, 255, 255, 0.04);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .glass-strong {
+            background: rgba(15, 15, 25, 0.85);
+            backdrop-filter: blur(30px);
+            -webkit-backdrop-filter: blur(30px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        /* ===== Header ===== */
+        .header {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 60px;
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 20px;
+            background: rgba(10, 10, 15, 0.6);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .header-brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .menu-btn {
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: rgba(255, 255, 255, 0.04);
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            transition: all 0.2s;
+        }
+        .menu-btn:hover { background: rgba(255, 255, 255, 0.08); border-color: rgba(255, 255, 255, 0.15); }
+        .menu-btn span {
+            display: block;
+            width: 16px;
+            height: 1.5px;
+            background: rgba(255, 255, 255, 0.7);
+            border-radius: 1px;
+            transition: all 0.3s;
+        }
+        .logo-text {
+            font-size: 16px;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            background: linear-gradient(135deg, #fff 0%, rgba(255,255,255,0.6) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .logo-dot {
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            background: #a78bfa;
+            border-radius: 50%;
+            margin-left: 2px;
+            vertical-align: middle;
+        }
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .lang-btn {
+            height: 32px;
+            padding: 0 12px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: rgba(255, 255, 255, 0.04);
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            letter-spacing: 0.05em;
+        }
+        .lang-btn:hover { background: rgba(255, 255, 255, 0.08); color: #fff; }
+
+        /* ===== Sidebar ===== */
+        .sidebar-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.6);
+            z-index: 200;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s;
+        }
+        .sidebar-overlay.open { opacity: 1; pointer-events: auto; }
+
+        .sidebar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 100%;
+            width: 320px;
+            max-width: 85vw;
+            z-index: 210;
+            transform: translateX(-100%);
+            transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+            overflow-y: auto;
+            background: rgba(12, 12, 20, 0.97);
+            backdrop-filter: blur(30px);
+            -webkit-backdrop-filter: blur(30px);
+            border-right: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .sidebar.open { transform: translateX(0); }
+
+        .sidebar-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 18px 20px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .sidebar-header h2 {
+            font-size: 16px;
+            font-weight: 700;
+            color: #fff;
+        }
+        .sidebar-close {
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            border: none;
+            background: rgba(255, 255, 255, 0.06);
+            color: rgba(255, 255, 255, 0.5);
+            font-size: 18px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }
+        .sidebar-close:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+
+        .sidebar-section {
+            padding: 20px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        .sidebar-section:last-child { border-bottom: none; }
+
+        .section-label {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: #a78bfa;
+            margin-bottom: 12px;
+        }
+        .sidebar-steps {
+            list-style: none;
+            counter-reset: step;
+        }
+        .sidebar-steps li {
+            counter-increment: step;
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            font-size: 13px;
+            color: rgba(255, 255, 255, 0.65);
+            margin-bottom: 10px;
+            line-height: 1.5;
+        }
+        .sidebar-steps li::before {
+            content: counter(step);
+            flex-shrink: 0;
+            width: 22px;
+            height: 22px;
+            border-radius: 6px;
+            background: rgba(167, 139, 250, 0.12);
+            color: #a78bfa;
+            font-size: 11px;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .sidebar-tip {
+            margin-top: 14px;
+            padding: 12px;
+            border-radius: 10px;
+            background: rgba(167, 139, 250, 0.06);
+            border: 1px solid rgba(167, 139, 250, 0.1);
+            font-size: 12px;
+            color: rgba(255, 255, 255, 0.55);
+            line-height: 1.6;
+        }
+        .sidebar-tip strong { color: #a78bfa; }
+
+        .platform-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 0;
+            font-size: 13px;
+            color: rgba(255, 255, 255, 0.7);
+        }
+        .platform-item .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #4ade80;
+            flex-shrink: 0;
+        }
+        .platform-item .name { font-weight: 500; }
+        .platform-item .desc {
+            margin-left: auto;
+            font-size: 11px;
+            color: rgba(255, 255, 255, 0.3);
+        }
+        .unsupported-box {
+            margin-top: 16px;
+            padding: 12px;
+            border-radius: 10px;
+            background: rgba(239, 68, 68, 0.06);
+            border: 1px solid rgba(239, 68, 68, 0.1);
+        }
+        .unsupported-box .label {
+            font-size: 11px;
+            font-weight: 700;
+            color: #f87171;
+            margin-bottom: 4px;
+        }
+        .unsupported-box .desc {
+            font-size: 12px;
+            color: rgba(255, 255, 255, 0.4);
+            line-height: 1.5;
+        }
+
+        /* ===== Main Content ===== */
+        .main-content {
+            padding-top: 80px;
+            padding-bottom: 120px;
+            max-width: 680px;
+            margin: 0 auto;
+            padding-left: 20px;
+            padding-right: 20px;
+        }
+
+        /* ===== Hero Welcome ===== */
+        .hero {
+            text-align: center;
+            padding: 40px 0 20px;
+        }
+        .hero-icon {
+            width: 56px;
+            height: 56px;
+            margin: 0 auto 20px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, rgba(167, 139, 250, 0.2) 0%, rgba(139, 92, 246, 0.1) 100%);
+            border: 1px solid rgba(167, 139, 250, 0.15);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+        }
+        .hero h1 {
+            font-size: 24px;
+            font-weight: 800;
+            letter-spacing: -0.03em;
+            margin-bottom: 8px;
+            background: linear-gradient(135deg, #fff 0%, rgba(255,255,255,0.65) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .hero p {
+            font-size: 14px;
+            color: rgba(255, 255, 255, 0.4);
+            max-width: 400px;
+            margin: 0 auto;
+        }
+
+        /* ===== Chat Messages ===== */
+        .chat-area {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            margin-top: 16px;
+        }
+        .msg-row {
+            display: flex;
+            opacity: 0;
+            animation: fadeUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+        .msg-row.user { justify-content: flex-end; }
+        .msg-row.bot { justify-content: flex-start; }
+
+        .msg-bubble {
+            max-width: 85%;
+            padding: 12px 16px;
+            border-radius: 16px;
+            font-size: 14px;
+            line-height: 1.6;
+            word-break: break-word;
+        }
+        .msg-row.user .msg-bubble {
+            background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%);
+            color: #fff;
+            border-bottom-right-radius: 4px;
+        }
+        .msg-row.bot .msg-bubble {
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            color: rgba(255, 255, 255, 0.8);
+            border-bottom-left-radius: 4px;
+        }
+
+        /* ===== Result Card ===== */
+        .result-card {
+            margin-top: 20px;
+            border-radius: 20px;
+            overflow: hidden;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            animation: fadeUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+        .result-cover-wrap {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            overflow: hidden;
+            background: #111;
+        }
+        .result-cover-wrap img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transition: transform 0.4s;
+        }
+        .result-card:hover .result-cover-wrap img {
+            transform: scale(1.03);
+        }
+        .result-badge {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            padding: 4px 10px;
+            border-radius: 8px;
+            font-size: 11px;
+            font-weight: 600;
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            color: rgba(255, 255, 255, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .result-type-badge {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            padding: 4px 10px;
+            border-radius: 8px;
+            font-size: 11px;
+            font-weight: 600;
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            color: rgba(255, 255, 255, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .result-info {
+            padding: 20px;
+        }
+        .result-title {
+            font-size: 17px;
+            font-weight: 700;
+            color: #fff;
+            margin-bottom: 16px;
+            line-height: 1.4;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+        .result-actions {
+            display: flex;
+            gap: 10px;
+        }
+        .btn {
+            flex: 1;
+            height: 44px;
+            border-radius: 12px;
+            border: none;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            transition: all 0.2s;
+        }
+        .btn:active { transform: scale(0.97); }
+        .btn-preview {
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: rgba(255, 255, 255, 0.8);
+        }
+        .btn-preview:hover { background: rgba(255, 255, 255, 0.12); color: #fff; }
+        .btn-download {
+            background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%);
+            color: #fff;
+        }
+        .btn-download:hover { filter: brightness(1.15); }
+        .btn-download:disabled {
+            background: rgba(255, 255, 255, 0.08);
+            color: rgba(255, 255, 255, 0.3);
+            cursor: not-allowed;
+            filter: none;
+        }
+
+        /* ===== Input Bar ===== */
+        .input-bar {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            z-index: 100;
+            padding: 16px 20px;
+            padding-bottom: max(16px, env(safe-area-inset-bottom));
+            background: rgba(10, 10, 15, 0.8);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-top: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .input-wrap {
+            max-width: 680px;
+            margin: 0 auto;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        .input-field {
+            flex: 1;
+            height: 48px;
+            padding: 0 18px;
+            border-radius: 14px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            background: rgba(255, 255, 255, 0.04);
+            color: #fff;
+            font-size: 14px;
+            font-family: inherit;
+            outline: none;
+            transition: all 0.2s;
+        }
+        .input-field::placeholder { color: rgba(255, 255, 255, 0.25); }
+        .input-field:focus {
+            border-color: rgba(167, 139, 250, 0.4);
+            background: rgba(255, 255, 255, 0.06);
+            box-shadow: 0 0 0 3px rgba(167, 139, 250, 0.08);
+        }
+        .send-btn {
+            width: 48px;
+            height: 48px;
+            border-radius: 14px;
+            border: none;
+            background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%);
+            color: #fff;
+            font-size: 18px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+        .send-btn:hover { filter: brightness(1.15); }
+        .send-btn:active { transform: scale(0.95); }
+        .send-btn svg {
+            width: 20px;
+            height: 20px;
+            fill: none;
+            stroke: currentColor;
+            stroke-width: 2;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+        }
+
+        /* ===== Preview Modal ===== */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 300;
+            background: rgba(0, 0, 0, 0.92);
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .modal-overlay.visible { display: flex; }
+        .modal-inner {
+            position: relative;
+            width: 100%;
+            max-width: 900px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .modal-content {
+            width: 100%;
+            max-height: 80vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 16px;
+            overflow: hidden;
+        }
+        .modal-content video {
+            width: 100%;
+            max-height: 80vh;
+            border-radius: 16px;
+            outline: none;
+            background: #000;
+        }
+        .modal-content img {
+            max-width: 100%;
+            max-height: 80vh;
+            object-fit: contain;
+            border-radius: 16px;
+        }
+        .modal-close {
+            position: absolute;
+            top: -48px;
+            right: 0;
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: rgba(255, 255, 255, 0.06);
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 20px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }
+        .modal-close:hover { background: #ef4444; color: #fff; border-color: #ef4444; }
+
+        .gallery-nav {
+            display: none;
+            margin-top: 16px;
+            align-items: center;
+            gap: 16px;
+            padding: 8px 20px;
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .gallery-nav.visible { display: flex; }
+        .gallery-nav button {
+            padding: 6px 14px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: rgba(255, 255, 255, 0.04);
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .gallery-nav button:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+        .gallery-nav .indicator {
+            font-size: 13px;
+            color: rgba(255, 255, 255, 0.4);
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* ===== Loading Dots ===== */
+        .loading-dots { display: inline-flex; gap: 4px; align-items: center; }
+        .loading-dots span {
+            width: 5px;
+            height: 5px;
+            background: rgba(255, 255, 255, 0.4);
+            border-radius: 50%;
+            animation: dotPulse 1.2s ease-in-out infinite;
+        }
+        .loading-dots span:nth-child(2) { animation-delay: 0.15s; }
+        .loading-dots span:nth-child(3) { animation-delay: 0.3s; }
+        @keyframes dotPulse {
+            0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
+            40% { opacity: 1; transform: scale(1.1); }
+        }
+
+        /* ===== Responsive ===== */
+        @media (max-width: 640px) {
+            .header { padding: 0 14px; height: 52px; }
+            .logo-text { font-size: 14px; }
+            .main-content { padding-top: 68px; padding-bottom: 100px; padding-left: 14px; padding-right: 14px; }
+            .hero { padding: 24px 0 12px; }
+            .hero-icon { width: 48px; height: 48px; font-size: 20px; margin-bottom: 16px; }
+            .hero h1 { font-size: 20px; }
+            .hero p { font-size: 13px; }
+            .msg-bubble { max-width: 90%; padding: 10px 14px; font-size: 13px; }
+            .result-info { padding: 16px; }
+            .result-title { font-size: 15px; }
+            .btn { height: 40px; font-size: 13px; }
+            .input-bar { padding: 12px 14px; }
+            .input-field { height: 44px; font-size: 14px; border-radius: 12px; }
+            .send-btn { width: 44px; height: 44px; border-radius: 12px; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Animated Background -->
+    <div class="bg-canvas"></div>
+    <div class="bg-grid"></div>
+
+    <!-- Header -->
+    <header class="header">
+        <div class="header-brand">
+            <button id="menu-button" class="menu-btn" aria-label="Menu">
+                <span></span><span></span><span></span>
+            </button>
+            <div class="logo-text">VideoParser<span class="logo-dot"></span></div>
+        </div>
+        <div class="header-actions">
+            <button id="lang-switch" class="lang-btn">EN</button>
+        </div>
+    </header>
+
+    <!-- Sidebar Overlay -->
+    <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
+    <!-- Sidebar -->
+    <aside id="sidebar" class="sidebar">
+        <div class="sidebar-header">
+            <h2 id="sidebar-title">使用说明</h2>
+            <button id="close-sidebar" class="sidebar-close">&times;</button>
+        </div>
+
+        <div class="sidebar-section">
+            <div class="section-label" id="sidebar-howto-title">如何使用</div>
+            <ol id="sidebar-steps" class="sidebar-steps">
+                <li>复制你想解析的视频链接</li>
+                <li>粘贴到下方输入框，点击发送</li>
+                <li>等待解析完成，即可预览或下载</li>
+            </ol>
+            <div class="sidebar-tip" id="sidebar-tip">
+                <strong>提示：</strong>支持直接粘贴包含链接的分享文本，系统会自动识别其中的链接。
+            </div>
+        </div>
+
+        <div class="sidebar-section">
+            <div class="section-label" id="sidebar-platforms-title">支持平台</div>
+
+            <div class="section-label" id="sidebar-rec-label" style="color: rgba(255,255,255,0.3); font-size: 10px; margin-top: 8px;">推荐 · 稳定支持</div>
+            <div id="platform-list">
+                <div class="platform-item"><span class="dot"></span><span class="name">YouTube</span><span class="desc">视频 / Shorts / 播放列表</span></div>
+                <div class="platform-item"><span class="dot"></span><span class="name">Bilibili (B站)</span><span class="desc">视频 / 番剧</span></div>
+                <div class="platform-item"><span class="dot"></span><span class="name">Twitter / X</span><span class="desc">视频推文</span></div>
+                <div class="platform-item"><span class="dot"></span><span class="name">Instagram</span><span class="desc">Reels / 帖子</span></div>
+                <div class="platform-item"><span class="dot"></span><span class="name">Facebook</span><span class="desc">视频 / Reels</span></div>
+                <div class="platform-item"><span class="dot"></span><span class="name">Vimeo</span><span class="desc">视频</span></div>
+                <div class="platform-item"><span class="dot"></span><span class="name">Twitch</span><span class="desc">回放 / 片段</span></div>
+                <div class="platform-item"><span class="dot"></span><span class="name">Dailymotion</span><span class="desc">视频</span></div>
+            </div>
+
+            <div class="section-label" id="sidebar-other-label" style="color: rgba(255,255,255,0.3); font-size: 10px; margin-top: 16px;">更多 · 1800+ 站点</div>
+            <p id="sidebar-other-desc" style="font-size: 12px; color: rgba(255,255,255,0.35); line-height: 1.6;">
+                基于 yt-dlp 引擎，还支持 TikTok、Reddit、Pinterest、Tumblr、SoundCloud、Nicovideo 等 1800+ 个站点。直接粘贴链接试试！
+            </p>
+
+            <div class="unsupported-box">
+                <div class="label" id="sidebar-unsupported-label">暂不支持</div>
+                <div class="desc" id="sidebar-unsupported-desc">抖音、快手、小红书（因平台反爬限制，暂不支持解析）</div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="main-content">
+        <div class="hero" id="hero-section">
+            <div class="hero-icon">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color: #a78bfa;">
+                    <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                </svg>
+            </div>
+            <h1 id="hero-title">全平台视频解析</h1>
+            <p id="hero-desc">粘贴任意视频链接，即可解析、预览和下载。支持 1800+ 平台。</p>
+        </div>
+
+        <div id="chat-history" class="chat-area"></div>
+        <div id="results-container"></div>
+    </main>
+
+    <!-- Input Bar -->
+    <footer class="input-bar">
+        <form id="parse-form" class="input-wrap" autocomplete="off">
+            <input id="video-url-input" type="text" class="input-field" data-translate-key="paste-placeholder" placeholder="粘贴视频链接..." autocomplete="off">
+            <button id="submit-button" type="submit" class="send-btn" aria-label="Send">
+                <svg viewBox="0 0 24 24"><path d="M22 2L11 13"></path><path d="M22 2L15 22L11 13L2 9L22 2Z"></path></svg>
+            </button>
+        </form>
+    </footer>
+
+    <!-- Preview Modal -->
+    <div id="preview-modal" class="modal-overlay">
+        <div class="modal-inner">
+            <div id="modal-content" class="modal-content"></div>
+            <div id="gallery-controls" class="gallery-nav">
+                <button id="prev-img">&larr;</button>
+                <span id="gallery-indicator" class="indicator">1 / 1</span>
+                <button id="next-img">&rarr;</button>
+            </div>
+            <button id="close-modal" class="modal-close">&times;</button>
+        </div>
+    </div>
+
+    <!-- Hidden -->
+    <div id="current-page-url" style="display:none;"></div>
+    <iframe id="download-iframe" style="display:none;" name="download_iframe"></iframe>
+
+    <script>
+        // --- DOM ---
+        const chatHistory = document.getElementById('chat-history');
+        const resultsContainer = document.getElementById('results-container');
+        const form = document.getElementById('parse-form');
+        const urlInput = document.getElementById('video-url-input');
+        const langSwitch = document.getElementById('lang-switch');
+        const currentPageUrlStore = document.getElementById('current-page-url');
+        const heroSection = document.getElementById('hero-section');
+
+        // --- i18n ---
+        const translations = {
+            en: {
+                'paste-placeholder': 'Paste any video link here...',
+                'send-button': 'Send',
+                'welcome-message': 'Hello! Paste a video link below to get started.',
+                'parsing-message': 'Analyzing the link, please wait',
+                'platform-detected': 'Platform',
+                'preview-button': 'Preview',
+                'download-video': 'Download',
+                'error-prefix': 'Error: ',
+                'error-default': 'Failed to parse.',
+                'invalid-link': 'Invalid link format. Please try again.',
+                'hero-title': 'Universal Video Parser',
+                'hero-desc': 'Paste any video link to parse, preview and download. Supports 1800+ platforms.'
+            },
+            zh: {
+                'paste-placeholder': '粘贴视频链接...',
+                'send-button': '发送',
+                'welcome-message': '您好！请在下方粘贴视频链接开始解析，支持绝大多数主流平台。',
+                'parsing-message': '正在解析链接，请稍候',
+                'platform-detected': '识别到平台',
+                'preview-button': '预览',
+                'download-video': '下载',
+                'error-prefix': '错误：',
+                'error-default': '链接解析失败。',
+                'invalid-link': '链接格式无效，请检查后重试',
+                'hero-title': '全平台视频解析',
+                'hero-desc': '粘贴任意视频链接，即可解析、预览和下载。支持 1800+ 平台。'
+            }
+        };
+        let currentLang = 'zh';
+
+        // --- Core ---
+        window.resetDownloadStatus = () => {
+            const btn = document.getElementById('download-button');
+            if (btn) {
+                btn.disabled = false;
+                btn.innerHTML = translations[currentLang]['download-video'];
+                btn.classList.remove('btn-disabled');
+            }
+        };
+
+        const updateAllText = (lang) => {
+            document.querySelectorAll('[data-translate-key]').forEach(el => {
+                const key = el.dataset.translateKey;
+                if (translations[lang][key]) {
+                    if (el.tagName === 'INPUT') {
+                        if (!el.dataset.isError) el.placeholder = translations[lang][key];
+                    } else {
+                        el.textContent = translations[lang][key];
+                    }
+                }
+            });
+            // Update hero
+            document.getElementById('hero-title').textContent = translations[lang]['hero-title'];
+            document.getElementById('hero-desc').textContent = translations[lang]['hero-desc'];
+        };
+
+        const addMessage = (content, sender, isHTML = false) => {
+            const row = document.createElement('div');
+            row.className = `msg-row ${sender}`;
+            const bubble = document.createElement('div');
+            bubble.className = 'msg-bubble';
+            if (isHTML) {
+                bubble.innerHTML = content;
+            } else {
+                bubble.textContent = content;
+            }
+            row.appendChild(bubble);
+            chatHistory.appendChild(row);
+            // Hide hero after first interaction
+            if (heroSection) heroSection.style.display = 'none';
+            window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+        };
+
+        // --- Modal ---
+        const modal = document.getElementById('preview-modal');
+        const modalContent = document.getElementById('modal-content');
+        const closeModalBtn = document.getElementById('close-modal');
+        const galleryControls = document.getElementById('gallery-controls');
+
+        let currentMediaList = [];
+        let currentIndex = 0;
+        let isCurrentVideo = true;
+
+        const openModal = () => { modal.classList.add('visible'); document.body.style.overflow = 'hidden'; };
+        const closeModal = () => { modalContent.innerHTML = ''; modal.classList.remove('visible'); document.body.style.overflow = ''; };
+
+        const renderModalContent = () => {
+            modalContent.innerHTML = '';
+            if (isCurrentVideo) {
+                galleryControls.classList.remove('visible');
+                modalContent.innerHTML = `<video src="${currentMediaList[0]}" controls autoplay controlsList="nodownload"></video>`;
+            } else {
+                modalContent.innerHTML = `<img src="${currentMediaList[currentIndex]}" />`;
+                if (currentMediaList.length > 1) {
+                    galleryControls.classList.add('visible');
+                    document.getElementById('gallery-indicator').textContent = `${currentIndex + 1} / ${currentMediaList.length}`;
+                } else {
+                    galleryControls.classList.remove('visible');
+                }
+            }
+        };
+
+        closeModalBtn.addEventListener('click', closeModal);
+        modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+        document.getElementById('prev-img').addEventListener('click', () => { if (currentIndex > 0) { currentIndex--; renderModalContent(); } });
+        document.getElementById('next-img').addEventListener('click', () => { if (currentIndex < currentMediaList.length - 1) { currentIndex++; renderModalContent(); } });
+
+        // --- Result Card ---
+        const displayVideoInfo = (data) => {
+            const { title, cover, videoUrl, platform, mediaList, isVideo } = data;
+            resultsContainer.innerHTML = '';
+
+            const card = document.createElement('div');
+            card.className = 'result-card';
+
+            const fallbackSvg = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1280' height='720'%3E%3Crect fill='%23181820' width='1280' height='720'/%3E%3Ctext x='640' y='360' text-anchor='middle' dy='0.35em' fill='%23555' font-size='32' font-family='sans-serif'%3ECover Not Found%3C/text%3E%3C/svg%3E";
+
+            card.innerHTML = `
+                <div class="result-cover-wrap">
+                    <img src="${cover}" alt="Cover" onerror="this.src='${fallbackSvg}'" />
+                    <div class="result-badge">${platform}</div>
+                    <div class="result-type-badge">${isVideo ? '🎥 ' + (currentLang === 'zh' ? '视频' : 'Video') : '🖼️ ' + (currentLang === 'zh' ? '图文' : 'Images')}</div>
+                </div>
+                <div class="result-info">
+                    <div class="result-title">${title}</div>
+                    <div class="result-actions">
+                        <button id="preview-button" class="btn btn-preview" data-translate-key="preview-button">${translations[currentLang]['preview-button']}</button>
+                        <button id="download-button" class="btn btn-download" data-translate-key="download-video">${translations[currentLang]['download-video']}</button>
+                    </div>
+                </div>
+            `;
+            resultsContainer.appendChild(card);
+
+            document.getElementById('preview-button').addEventListener('click', () => {
+                currentMediaList = mediaList && mediaList.length > 0 ? mediaList : [videoUrl];
+                isCurrentVideo = isVideo;
+                currentIndex = 0;
+                openModal();
+                renderModalContent();
+            });
+
+            document.getElementById('download-button').addEventListener('click', (e) => {
+                const btn = e.currentTarget;
+                const pageUrl = currentPageUrlStore.textContent;
+                if (!pageUrl) {
+                    alert(currentLang === 'zh' ? '错误：无法找到视频链接，请重新解析。' : 'Error: Cannot find video URL. Please parse again.');
+                    return;
+                }
+                btn.disabled = true;
+                btn.innerHTML = currentLang === 'zh' ? '下载中...' : 'Downloading...';
+                const safeTitle = title.replace(/[^a-zA-Z0-9\u4e00-\u9fa5_\-]/g, '_') || 'download';
+                document.getElementById('download-iframe').src = `/api/download?pageUrl=${encodeURIComponent(pageUrl)}&title=${encodeURIComponent(safeTitle)}`;
+                setTimeout(() => { if (btn.disabled) window.resetDownloadStatus(); }, 3000);
+            });
+
+            updateAllText(currentLang);
+        };
+
+        const triggerInputError = () => {
+            form.classList.add('animate-shake');
+            urlInput.placeholder = translations[currentLang]['invalid-link'];
+            urlInput.dataset.isError = 'true';
+            setTimeout(() => {
+                form.classList.remove('animate-shake');
+                urlInput.placeholder = translations[currentLang]['paste-placeholder'];
+                delete urlInput.dataset.isError;
+            }, 2000);
+        };
+
+        const extractUrl = (text) => {
+            if (!text) return null;
+            const m = text.match(/(https?:\/\/[^\s]+)/);
+            return m ? m[0] : null;
+        };
+
+        const handleUrlSubmission = async (rawText) => {
+            const url = extractUrl(rawText);
+            if (!url) { triggerInputError(); return; }
+
+            currentPageUrlStore.textContent = url;
+            addMessage(rawText, 'user');
+            urlInput.value = '';
+            resultsContainer.innerHTML = '';
+
+            const loadingHTML = `<span data-translate-key="parsing-message">${translations[currentLang]['parsing-message']}</span> <span class="loading-dots"><span></span><span></span><span></span></span>`;
+            addMessage(loadingHTML, 'bot', true);
+
+            try {
+                const response = await fetch('/api/parse', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+                const result = await response.json();
+                chatHistory.removeChild(chatHistory.lastChild);
+
+                if (!response.ok || !result.success) throw new Error(result.message || translations[currentLang]['error-default']);
+
+                const platform = result.data.platform || (currentLang === 'zh' ? '未知平台' : 'Unknown');
+                const platformMsg = `<span data-translate-key="platform-detected">${translations[currentLang]['platform-detected']}</span>: <strong>${platform}</strong>`;
+                addMessage(platformMsg, 'bot', true);
+                displayVideoInfo(result.data);
+
+            } catch (err) {
+                if (chatHistory.lastChild) chatHistory.removeChild(chatHistory.lastChild);
+                const errorMsg = `<span data-translate-key="error-prefix">${translations[currentLang]['error-prefix']}</span>${err.message}`;
+                addMessage(errorMsg, 'bot', true);
+            }
+        };
+
+        // --- Events ---
+        langSwitch.addEventListener('click', () => {
+            currentLang = currentLang === 'zh' ? 'en' : 'zh';
+            langSwitch.textContent = currentLang === 'zh' ? 'EN' : '中文';
+            document.documentElement.lang = currentLang;
+            updateAllText(currentLang);
+            updateSidebarLang(currentLang);
+        });
+
+        form.addEventListener('submit', e => { e.preventDefault(); handleUrlSubmission(urlInput.value); });
+
+        // ESC to close modal
+        document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+        // --- Sidebar ---
+        const sidebar = document.getElementById('sidebar');
+        const sidebarOverlay = document.getElementById('sidebar-overlay');
+
+        const sidebarText = {
+            zh: {
+                title: '使用说明',
+                howtoTitle: '如何使用',
+                steps: ['复制你想解析的视频链接', '粘贴到下方输入框，点击发送', '等待解析完成，即可预览或下载'],
+                tip: '<strong>提示：</strong>支持直接粘贴包含链接的分享文本，系统会自动识别其中的链接。',
+                platformsTitle: '支持平台',
+                recLabel: '推荐 · 稳定支持',
+                otherLabel: '更多 · 1800+ 站点',
+                otherDesc: '基于 yt-dlp 引擎，还支持 TikTok、Reddit、Pinterest、Tumblr、SoundCloud、Nicovideo 等 1800+ 个站点。直接粘贴链接试试！',
+                unsupportedLabel: '暂不支持',
+                unsupportedDesc: '抖音、快手、小红书（因平台反爬限制，暂不支持解析）'
+            },
+            en: {
+                title: 'Guide',
+                howtoTitle: 'How to Use',
+                steps: ['Copy the video link you want to parse', 'Paste it in the input box and click Send', 'Wait for parsing, then preview or download'],
+                tip: '<strong>Tip:</strong> You can paste share text containing a link — the system will auto-detect it.',
+                platformsTitle: 'Supported Platforms',
+                recLabel: 'Recommended · Stable',
+                otherLabel: 'More · 1800+ Sites',
+                otherDesc: 'Powered by yt-dlp engine, also supports TikTok, Reddit, Pinterest, Tumblr, SoundCloud, Nicovideo and 1800+ more sites. Just paste a link and try!',
+                unsupportedLabel: 'Not Supported',
+                unsupportedDesc: 'Douyin, Kuaishou, Xiaohongshu (blocked by platform anti-scraping)'
+            }
+        };
+
+        const updateSidebarLang = (lang) => {
+            const t = sidebarText[lang];
+            document.getElementById('sidebar-title').textContent = t.title;
+            document.getElementById('sidebar-howto-title').textContent = t.howtoTitle;
+            const stepsOl = document.getElementById('sidebar-steps');
+            stepsOl.innerHTML = t.steps.map(s => `<li>${s}</li>`).join('');
+            document.getElementById('sidebar-tip').innerHTML = t.tip;
+            document.getElementById('sidebar-platforms-title').textContent = t.platformsTitle;
+            document.getElementById('sidebar-rec-label').textContent = t.recLabel;
+            document.getElementById('sidebar-other-label').textContent = t.otherLabel;
+            document.getElementById('sidebar-other-desc').textContent = t.otherDesc;
+            document.getElementById('sidebar-unsupported-label').textContent = t.unsupportedLabel;
+            document.getElementById('sidebar-unsupported-desc').textContent = t.unsupportedDesc;
+        };
+
+        const openSidebar = () => {
+            sidebar.classList.add('open');
+            sidebarOverlay.classList.add('open');
+            document.body.style.overflow = 'hidden';
+            updateSidebarLang(currentLang);
+        };
+        const closeSidebar = () => {
+            sidebar.classList.remove('open');
+            sidebarOverlay.classList.remove('open');
+            document.body.style.overflow = '';
+        };
+
+        document.getElementById('menu-button').addEventListener('click', openSidebar);
+        document.getElementById('close-sidebar').addEventListener('click', closeSidebar);
+        sidebarOverlay.addEventListener('click', closeSidebar);
+
+        // --- Init ---
+        window.onload = () => {
+            updateAllText(currentLang);
+        };
+    </script>
+</body>
+</html>
