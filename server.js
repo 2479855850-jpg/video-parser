@@ -98,15 +98,30 @@ const findOutputFile = (tmpFile) => {
     return path.join(dir, biggest);
 };
 
+// 检测是否有 Chrome 浏览器可用（Docker 中没有）
+let hasChromeAvailable = false;
+try {
+    if (process.platform === 'darwin') {
+        fs.accessSync('/Applications/Google Chrome.app');
+        hasChromeAvailable = true;
+    } else if (process.platform === 'linux') {
+        execSync('which google-chrome || which chromium-browser || which chromium', { encoding: 'utf-8' });
+        hasChromeAvailable = true;
+    } else if (process.platform === 'win32') {
+        hasChromeAvailable = true; // Windows 一般有
+    }
+} catch { hasChromeAvailable = false; }
+console.log(`[配置] Chrome 可用: ${hasChromeAvailable}`);
+
 // 通用 yt-dlp 下载参数
 const buildYtdlpArgs = (url, outputPath, maxHeight) => {
     const args = [url];
 
-    // 格式选择：优先 H.264 单文件，回退到合并
+    // 格式选择：[vcodec!=none] 确保有视频轨道，不会下到纯音频
     if (maxHeight) {
-        args.push('-f', `best[height<=${maxHeight}][ext=mp4]/best[height<=${maxHeight}]/bestvideo[height<=${maxHeight}][vcodec^=avc]+bestaudio/bestvideo[height<=${maxHeight}]+bestaudio/best`);
+        args.push('-f', `best[ext=mp4][vcodec!=none][height<=${maxHeight}]/best[vcodec!=none][height<=${maxHeight}]/bestvideo[height<=${maxHeight}][vcodec^=avc]+bestaudio/bestvideo[height<=${maxHeight}]+bestaudio/best[vcodec!=none]`);
     } else {
-        args.push('-f', `best[ext=mp4]/best/bestvideo[vcodec^=avc]+bestaudio/bestvideo+bestaudio`);
+        args.push('-f', `best[ext=mp4][vcodec!=none]/best[vcodec!=none]/bestvideo[vcodec^=avc]+bestaudio/bestvideo+bestaudio/best`);
     }
 
     args.push(
@@ -123,21 +138,16 @@ const buildYtdlpArgs = (url, outputPath, maxHeight) => {
         if (dir && dir !== '.') args.push('--ffmpeg-location', dir);
     }
 
-    // 需要 cookies 的平台
-    if (/douyin\.com|iesdouyin\.com/.test(url)) {
-        const cp = path.join(__dirname, 'cookies.txt');
-        if (fs.existsSync(cp)) args.push('--cookies', cp);
-        else args.push('--cookies-from-browser', 'chrome');
-    }
-    if (/twitter\.com|x\.com/.test(url)) {
-        const cp = path.join(__dirname, 'cookies.txt');
-        if (fs.existsSync(cp)) args.push('--cookies', cp);
-        else args.push('--cookies-from-browser', 'chrome');
-    }
-    if (/instagram\.com/.test(url)) {
-        const cp = path.join(__dirname, 'cookies.txt');
-        if (fs.existsSync(cp)) args.push('--cookies', cp);
-        else args.push('--cookies-from-browser', 'chrome');
+    // Cookies：只在有 cookies.txt 或有 Chrome 时才加
+    const cookiesPath = path.join(__dirname, 'cookies.txt');
+    const needsCookies = /douyin\.com|iesdouyin\.com|twitter\.com|x\.com|instagram\.com/.test(url);
+    if (needsCookies) {
+        if (fs.existsSync(cookiesPath)) {
+            args.push('--cookies', cookiesPath);
+        } else if (hasChromeAvailable) {
+            args.push('--cookies-from-browser', 'chrome');
+        }
+        // Docker 没有 Chrome 且没有 cookies.txt 时不加任何 cookie 参数，避免报错
     }
 
     return args;
@@ -166,7 +176,7 @@ app.post('/api/parse', async (req, res) => {
         if (/douyin\.com|iesdouyin\.com|twitter\.com|x\.com|instagram\.com/.test(url)) {
             const cp = path.join(__dirname, 'cookies.txt');
             if (fs.existsSync(cp)) opts.cookies = cp;
-            else opts.cookiesFromBrowser = 'chrome';
+            else if (hasChromeAvailable) opts.cookiesFromBrowser = 'chrome';
         }
 
         const metadata = await youtubedl(url, opts);
