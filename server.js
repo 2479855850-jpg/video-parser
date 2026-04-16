@@ -13,13 +13,12 @@ let ytdlpPath;
 try {
     ytdlpPath = execSync(process.platform === 'win32' ? 'where yt-dlp' : 'which yt-dlp', { encoding: 'utf-8' }).trim().split('\n')[0];
 } catch {
-    ytdlpPath = 'yt-dlp'; // 依赖 PATH 中存在 yt-dlp
+    ytdlpPath = 'yt-dlp';
 }
 console.log(`[配置] yt-dlp 路径: ${ytdlpPath}`);
 youtubedl.path = ytdlpPath;
 
 // --- ffmpeg 路径（用于音视频合并）---
-// 优先系统 ffmpeg（Docker 环境），其次 ffmpeg-static（本地开发）
 let ffmpegPath;
 try {
     ffmpegPath = execSync(process.platform === 'win32' ? 'where ffmpeg' : 'which ffmpeg', { encoding: 'utf-8' }).trim().split('\n')[0];
@@ -51,9 +50,43 @@ const friendlyError = (msg) => {
     return '解析失败，请检查链接是否正确或稍后重试';
 };
 
-// --- 封面缓存（ID -> 原始 URL）---
-const coverCache = new Map();
-let coverId = 0;
+// 根据 URL 猜测合适的 Referer
+const guessReferer = (url) => {
+    try {
+        const host = new URL(url).hostname;
+        if (/instagram|cdninstagram|fbcdn/.test(host)) return 'https://www.instagram.com/';
+        if (/ytimg|youtube|googlevideo|ggpht/.test(host)) return 'https://www.youtube.com/';
+        if (/bilivideo|hdslb|biliimg/.test(host)) return 'https://www.bilibili.com/';
+        if (/twimg|twitter|x\.com/.test(host)) return 'https://twitter.com/';
+        if (/tiktok/.test(host)) return 'https://www.tiktok.com/';
+        return '';
+    } catch { return ''; }
+};
+
+// 通用代理请求头
+const proxyHeaders = (targetUrl) => {
+    const referer = guessReferer(targetUrl);
+    return {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Sec-Fetch-Dest': 'video',
+        'Sec-Fetch-Mode': 'no-cors',
+        'Sec-Fetch-Site': 'cross-site',
+        ...(referer ? { 'Referer': referer, 'Origin': referer.replace(/\/$/, '') } : {})
+    };
+};
+
+// --- 缓存：ID -> { url, sourceUrl, type } ---
+const mediaCache = new Map();
+let mediaId = 0;
+
+const cacheUrl = (url, sourceUrl, type = 'media') => {
+    const id = ++mediaId;
+    mediaCache.set(id, { url, sourceUrl, type });
+    setTimeout(() => mediaCache.delete(id), 3600000); // 1 小时后清理
+    return id;
+};
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -75,31 +108,26 @@ app.post('/api/parse', async (req, res) => {
             addHeader: ['User-Agent:Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36']
         };
 
-        // 抖音需要 cookies
         const isDouyin = /douyin\.com|iesdouyin\.com/.test(url);
         if (isDouyin) {
             const cookiesPath = path.join(__dirname, 'cookies.txt');
             if (fs.existsSync(cookiesPath)) {
                 ytdlpOptions.cookies = cookiesPath;
-                console.log('[配置] 使用 cookies.txt');
             } else {
                 ytdlpOptions.cookiesFromBrowser = 'chrome';
-                console.log('[配置] 从 Chrome 提取 cookies');
             }
         }
 
         const metadata = await youtubedl(url, ytdlpOptions);
         console.log(`[成功] 解析完成: ${metadata.title}`);
 
-        // 提取视频直链：优先 url，其次从 formats/requested_formats 里取最佳
+        // 提取视频直链
         let videoUrl = metadata.url || '';
         if (!videoUrl && metadata.requested_formats && metadata.requested_formats.length > 0) {
-            // 优先取有视频编码的格式（非纯音频）
             const videoFormat = metadata.requested_formats.find(f => f.vcodec && f.vcodec !== 'none');
             videoUrl = videoFormat ? videoFormat.url : metadata.requested_formats[0].url;
         }
         if (!videoUrl && metadata.formats && metadata.formats.length > 0) {
-            // 从所有格式中取最后一个（通常是最高质量）
             for (let i = metadata.formats.length - 1; i >= 0; i--) {
                 const f = metadata.formats[i];
                 if (f.url && f.vcodec && f.vcodec !== 'none') {
@@ -107,7 +135,6 @@ app.post('/api/parse', async (req, res) => {
                     break;
                 }
             }
-            // 实在没有带视频的，取最后一个
             if (!videoUrl) videoUrl = metadata.formats[metadata.formats.length - 1].url || '';
         }
 
@@ -115,40 +142,41 @@ app.post('/api/parse', async (req, res) => {
         const imageExts = ['jpg', 'jpeg', 'png', 'webp', 'gif'];
         const isVideo = !(metadata.entries && metadata.entries.length > 0) && !imageExts.includes(metadata.ext);
 
-        // 构建 mediaList
-        let mediaList = [];
+        // 构建 mediaList（原始 URL）
+        let rawMediaList = [];
         if (metadata.entries && metadata.entries.length > 0) {
-            mediaList = metadata.entries.map(entry => entry.url || entry.thumbnail).filter(Boolean);
+            rawMediaList = metadata.entries.map(entry => entry.url || entry.thumbnail).filter(Boolean);
         } else if (videoUrl) {
-            mediaList = [videoUrl];
+            rawMediaList = [videoUrl];
         }
 
-        // 封面走代理（用短 ID 映射，避免 URL 编码问题）
-        // 优先 metadata.thumbnail，其次从 thumbnails 数组取最高清的
+        // 将所有媒体 URL 转为代理 URL（解决 CDN IP 锁定问题）
+        const proxyMediaList = rawMediaList.map(rawUrl => {
+            const id = cacheUrl(rawUrl, url, isVideo ? 'video' : 'image');
+            return `/api/stream/${id}`;
+        });
+
+        // 封面代理
         let rawCover = metadata.thumbnail || '';
         if (!rawCover && metadata.thumbnails && metadata.thumbnails.length > 0) {
-            // thumbnails 数组通常最后一个是最高清的
             rawCover = metadata.thumbnails[metadata.thumbnails.length - 1].url || '';
         }
         let cover = '/placeholder.svg';
         if (rawCover) {
-            const id = ++coverId;
-            coverCache.set(id, { url: rawCover, sourceUrl: url });
-            cover = `/api/cover/${id}?t=${Date.now()}`;
-            // 1 小时后自动清理
-            setTimeout(() => coverCache.delete(id), 3600000);
+            const id = cacheUrl(rawCover, url, 'image');
+            cover = `/api/stream/${id}?t=${Date.now()}`;
         }
-        console.log(`[封面] 原始封面URL: ${rawCover ? rawCover.substring(0, 80) + '...' : '无'}`);
+        console.log(`[封面] 原始URL: ${rawCover ? rawCover.substring(0, 80) + '...' : '无'}`);
 
         res.json({
             success: true,
             data: {
                 title: metadata.title || '未知视频标题',
                 cover: cover,
-                videoUrl: videoUrl,
+                videoUrl: proxyMediaList.length > 0 ? proxyMediaList[0] : '',
                 platform: metadata.extractor_key || 'Unknown',
                 isVideo: isVideo,
-                mediaList: mediaList
+                mediaList: proxyMediaList
             }
         });
 
@@ -159,88 +187,88 @@ app.post('/api/parse', async (req, res) => {
     }
 });
 
-// --- 封面图代理接口 ---
-app.get('/api/cover/:id', async (req, res) => {
+// --- 统一媒体代理接口（封面 + 视频预览 + 图片都走这里）---
+app.get('/api/stream/:id', async (req, res) => {
     const id = parseInt(req.params.id);
-    const cacheEntry = coverCache.get(id);
-    if (!cacheEntry) return res.redirect('/placeholder.svg');
+    const entry = mediaCache.get(id);
+    if (!entry) {
+        return res.redirect('/placeholder.svg');
+    }
 
-    const imageUrl = typeof cacheEntry === 'string' ? cacheEntry : cacheEntry.url;
-    const sourceUrl = typeof cacheEntry === 'object' ? cacheEntry.sourceUrl : '';
-    if (!imageUrl) return res.redirect('/placeholder.svg');
+    const targetUrl = entry.url;
+    if (!targetUrl) return res.redirect('/placeholder.svg');
 
-    // 根据图片 URL 域名构造合适的 Referer
-    let referer = '';
-    try {
-        const imgHost = new URL(imageUrl).hostname;
-        if (/instagram|cdninstagram|fbcdn/.test(imgHost)) referer = 'https://www.instagram.com/';
-        else if (/ytimg|youtube|googlevideo/.test(imgHost)) referer = 'https://www.youtube.com/';
-        else if (/bilivideo|hdslb|biliimg/.test(imgHost)) referer = 'https://www.bilibili.com/';
-        else if (/twimg/.test(imgHost)) referer = 'https://twitter.com/';
-        else if (/pximg/.test(imgHost)) referer = 'https://www.pixiv.net/';
-        else {
-            try { referer = new URL(sourceUrl).origin + '/'; } catch {}
-        }
-    } catch {}
+    const headers = proxyHeaders(targetUrl);
+
+    // 支持 Range 请求（视频拖动进度条）
+    if (req.headers.range) {
+        headers['Range'] = req.headers.range;
+    }
 
     try {
         const response = await axios({
             method: 'GET',
-            url: imageUrl,
+            url: targetUrl,
             responseType: 'stream',
-            timeout: 15000,
+            timeout: 30000,
             maxRedirects: 5,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Sec-Fetch-Dest': 'image',
-                'Sec-Fetch-Mode': 'no-cors',
-                'Sec-Fetch-Site': 'cross-site',
-                ...(referer ? { 'Referer': referer } : {})
-            }
+            headers: headers
         });
 
-        // 透传原始 Content-Type
-        const ct = response.headers['content-type'] || 'image/jpeg';
+        // 透传响应头
+        const ct = response.headers['content-type'] || (entry.type === 'video' ? 'video/mp4' : 'image/jpeg');
         res.setHeader('Content-Type', ct);
-        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.setHeader('Accept-Ranges', 'bytes');
         if (response.headers['content-length']) {
             res.setHeader('Content-Length', response.headers['content-length']);
         }
+        if (response.headers['content-range']) {
+            res.setHeader('Content-Range', response.headers['content-range']);
+            res.status(206);
+        }
+        // 允许缓存
+        res.setHeader('Cache-Control', 'public, max-age=1800');
+
         response.data.pipe(res);
+
+        response.data.on('error', () => {
+            if (!res.headersSent) res.redirect('/placeholder.svg');
+        });
+
     } catch (err) {
-        console.error('[封面代理报错]', imageUrl.substring(0, 80), err.message);
-        // 如果带 Referer 失败，尝试不带 Referer 重试一次
+        console.error(`[代理报错] ${entry.type}`, targetUrl.substring(0, 60), err.message);
+        // 重试一次（不带 Referer）
         try {
+            const retryHeaders = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': '*/*'
+            };
+            if (req.headers.range) retryHeaders['Range'] = req.headers.range;
+
             const retry = await axios({
                 method: 'GET',
-                url: imageUrl,
+                url: targetUrl,
                 responseType: 'stream',
-                timeout: 15000,
+                timeout: 30000,
                 maxRedirects: 5,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'image/*,*/*;q=0.8'
-                }
+                headers: retryHeaders
             });
-            const ct = retry.headers['content-type'] || 'image/jpeg';
+            const ct = retry.headers['content-type'] || 'application/octet-stream';
             res.setHeader('Content-Type', ct);
-            res.setHeader('Cache-Control', 'public, max-age=3600');
-            if (retry.headers['content-length']) {
-                res.setHeader('Content-Length', retry.headers['content-length']);
-            }
+            if (retry.headers['content-length']) res.setHeader('Content-Length', retry.headers['content-length']);
+            if (retry.headers['content-range']) { res.setHeader('Content-Range', retry.headers['content-range']); res.status(206); }
             retry.data.pipe(res);
         } catch (retryErr) {
-            console.error('[封面代理重试也失败]', retryErr.message);
+            console.error('[代理重试也失败]', retryErr.message);
             if (!res.headersSent) {
-                res.redirect('/placeholder.svg');
+                if (entry.type === 'image') res.redirect('/placeholder.svg');
+                else res.status(502).send('媒体加载失败');
             }
         }
     }
 });
 
-// --- 下载接口（使用 yt-dlp 下载到临时文件，确保 mp4 格式完整）---
+// --- 下载接口（使用 yt-dlp 下载到临时文件）---
 app.get('/api/download', (req, res) => {
     const { pageUrl, title } = req.query;
 
@@ -252,20 +280,21 @@ app.get('/api/download', (req, res) => {
     const safeTitle = (title || 'download').replace(/[^a-zA-Z0-9\u4e00-\u9fa5_\-]/g, '_');
     console.log(`[下载] ${safeTitle} <- ${decodedUrl.substring(0, 80)}...`);
 
-    // 下载到临时文件（mp4 合并需要可写文件，stdout 管道会导致文件损坏）
     const os = require('os');
     const tmpFile = path.join(os.tmpdir(), `vp_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
 
     const { spawn } = require('child_process');
     const args = [
         decodedUrl,
-        // 优先 H.264 视频（兼容性最好），回退到任意格式
-        '-f', 'bv[vcodec^=avc]+ba/bv*+ba/b/best',
+        // 格式选择：优先 H.264+音频合并，回退到任意视频+音频，再回退到最佳单文件
+        '-f', 'bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc]+bestaudio/bestvideo+bestaudio/best',
         '--merge-output-format', 'mp4',
         '--remux-video', 'mp4',
-        '--ffmpeg-location', path.dirname(ffmpegPath),
-        '--ppa', 'ffmpeg:-movflags +faststart',
+        '--ffmpeg-location', ffmpegPath.includes('/') ? path.dirname(ffmpegPath) : ffmpegPath,
+        '--postprocessor-args', 'ffmpeg:-movflags +faststart',
         '--no-warnings',
+        '--no-playlist',
+        '--verbose',
         '-o', tmpFile
     ];
 
@@ -280,11 +309,19 @@ app.get('/api/download', (req, res) => {
         }
     }
 
+    console.log(`[下载] yt-dlp 参数:`, args.join(' '));
+
     const child = spawn(ytdlpPath, args);
 
+    let stderrLog = '';
+    child.stdout.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg) console.log('[下载 stdout]', msg);
+    });
     child.stderr.on('data', (data) => {
         const msg = data.toString().trim();
-        if (msg) console.log('[下载 yt-dlp]', msg);
+        stderrLog += msg + '\n';
+        if (msg) console.log('[下载 stderr]', msg);
     });
 
     child.on('error', (err) => {
@@ -296,6 +333,7 @@ app.get('/api/download', (req, res) => {
     child.on('close', (code) => {
         if (code !== 0) {
             console.error('[下载] yt-dlp 退出码:', code);
+            console.error('[下载] 错误日志:', stderrLog.substring(0, 500));
             fs.unlink(tmpFile, () => {});
             if (!res.headersSent) return res.status(500).send('下载失败');
             return;
@@ -304,23 +342,29 @@ app.get('/api/download', (req, res) => {
         // yt-dlp 可能会自动加后缀，查找实际文件
         let actualFile = tmpFile;
         if (!fs.existsSync(actualFile)) {
-            // 尝试查找同前缀的文件
             const dir = path.dirname(tmpFile);
             const base = path.basename(tmpFile, '.mp4');
             const files = fs.readdirSync(dir).filter(f => f.startsWith(base));
             if (files.length > 0) {
                 actualFile = path.join(dir, files[0]);
             } else {
+                console.error('[下载] 找不到输出文件, tmpFile=', tmpFile);
                 if (!res.headersSent) res.status(500).send('下载失败：文件未生成');
                 return;
             }
         }
 
         const stat = fs.statSync(actualFile);
-        console.log(`[下载] 完成，文件大小: ${(stat.size / 1024 / 1024).toFixed(1)}MB`);
+        const sizeMB = (stat.size / 1024 / 1024).toFixed(1);
+        console.log(`[下载] 完成，文件大小: ${sizeMB}MB, 路径: ${actualFile}`);
 
-        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeTitle)}.mp4"`);
-        res.setHeader('Content-Type', 'video/mp4');
+        // 根据实际文件扩展名设置正确的 Content-Type
+        const ext = path.extname(actualFile).toLowerCase();
+        const mimeMap = { '.mp4': 'video/mp4', '.webm': 'video/webm', '.mkv': 'video/x-matroska', '.m4a': 'audio/mp4' };
+        const contentType = mimeMap[ext] || 'video/mp4';
+
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeTitle)}${ext || '.mp4'}"`);
+        res.setHeader('Content-Type', contentType);
         res.setHeader('Content-Length', stat.size);
 
         const stream = fs.createReadStream(actualFile);
@@ -335,7 +379,6 @@ app.get('/api/download', (req, res) => {
     // 用户断开连接时终止 yt-dlp 进程并清理
     res.on('close', () => {
         if (!child.killed) child.kill();
-        // 延迟清理，避免竞态
         setTimeout(() => fs.unlink(tmpFile, () => {}), 5000);
     });
 });

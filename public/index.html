@@ -931,7 +931,7 @@
             modalContent.innerHTML = '';
             if (isCurrentVideo) {
                 galleryControls.classList.remove('visible');
-                modalContent.innerHTML = `<video src="${currentMediaList[0]}" controls autoplay controlsList="nodownload"></video>`;
+                modalContent.innerHTML = `<video src="${currentMediaList[0]}" controls autoplay playsinline webkit-playsinline controlsList="nodownload" preload="auto"></video>`;
             } else {
                 modalContent.innerHTML = `<img src="${currentMediaList[currentIndex]}" />`;
                 if (currentMediaList.length > 1) {
