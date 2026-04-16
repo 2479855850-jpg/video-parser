@@ -44,7 +44,8 @@ const friendlyError = (msg) => {
     if (/403|Forbidden/i.test(msg)) return '访问被拒绝，请稍后重试';
     if (/404/.test(msg)) return '内容不存在 (404)';
     if (/timed?\s*out/i.test(msg)) return '请求超时，请检查网络后重试';
-    if (/empty.*response/i.test(msg)) return '平台返回空数据，可能需要登录才能访问';
+    if (/empty.*response/i.test(msg)) return 'Instagram 需要登录才能访问，暂不支持解析私密内容';
+    if (/instagram.*API.*not.*granting/i.test(msg)) return 'Instagram 接口受限，请稍后重试';
     return '解析失败，请检查链接是否正确或稍后重试';
 };
 
@@ -113,16 +114,31 @@ try {
 } catch { hasChromeAvailable = false; }
 console.log(`[配置] Chrome 可用: ${hasChromeAvailable}`);
 
+// 用 ffmpeg 探测文件是否包含视频轨道
+const probeHasVideo = (filePath) => {
+    try {
+        const out = execSync(`"${ffmpegPath}" -i "${filePath}" 2>&1 || true`, { encoding: 'utf-8', timeout: 10000 });
+        return /Stream.*Video:/i.test(out);
+    } catch { return false; }
+};
+
 // 通用 yt-dlp 下载参数
-const buildYtdlpArgs = (url, outputPath, maxHeight) => {
+const buildYtdlpArgs = (url, outputPath, maxHeight, forceVideo = true) => {
     const args = [url];
 
-    // 格式选择：[vcodec!=none] 确保有视频轨道，不会下到纯音频
-    if (maxHeight) {
-        args.push('-f', `best[ext=mp4][vcodec!=none][height<=${maxHeight}]/best[vcodec!=none][height<=${maxHeight}]/bestvideo[height<=${maxHeight}][vcodec^=avc]+bestaudio/bestvideo[height<=${maxHeight}]+bestaudio/best[vcodec!=none]`);
-    } else {
-        args.push('-f', `best[ext=mp4][vcodec!=none]/best[vcodec!=none]/bestvideo[vcodec^=avc]+bestaudio/bestvideo+bestaudio/best`);
+    if (forceVideo) {
+        // 强制选包含视频的格式，绝不选纯音频
+        // bv*+ba = 最佳视频(可能含音频) + 最佳音频
+        // b = 最佳已合并格式 (作为后备)
+        // 所有格式都要求 vcodec!=none (排除纯音频)
+        let heightFilter = maxHeight ? `[height<=${maxHeight}]` : '';
+        args.push('-f', `bv*${heightFilter}[vcodec!=none]+ba[ext=m4a]/bv*${heightFilter}[vcodec!=none]+ba/bv*${heightFilter}[vcodec!=none]/b${heightFilter}[vcodec!=none]/b${heightFilter}`);
     }
+
+    // 排序偏好 h264+aac+mp4
+    const sortParts = ['vcodec:h264', 'acodec:aac', 'ext:mp4:m4a'];
+    if (maxHeight) sortParts.push(`res:${maxHeight}`);
+    args.push('-S', sortParts.join(','));
 
     args.push(
         '--merge-output-format', 'mp4',
@@ -138,7 +154,7 @@ const buildYtdlpArgs = (url, outputPath, maxHeight) => {
         if (dir && dir !== '.') args.push('--ffmpeg-location', dir);
     }
 
-    // Cookies：只在有 cookies.txt 或有 Chrome 时才加
+    // Cookies
     const cookiesPath = path.join(__dirname, 'cookies.txt');
     const needsCookies = /douyin\.com|iesdouyin\.com|twitter\.com|x\.com|instagram\.com/.test(url);
     if (needsCookies) {
@@ -147,7 +163,6 @@ const buildYtdlpArgs = (url, outputPath, maxHeight) => {
         } else if (hasChromeAvailable) {
             args.push('--cookies-from-browser', 'chrome');
         }
-        // Docker 没有 Chrome 且没有 cookies.txt 时不加任何 cookie 参数，避免报错
     }
 
     return args;
@@ -267,7 +282,7 @@ app.get('/api/preview', (req, res) => {
     previewCache.set(pageUrl, entry);
 
     console.log(`[预览] 下载: ${pageUrl.substring(0, 60)}...`);
-    const args = buildYtdlpArgs(pageUrl, tmpFile, 720);
+    const args = buildYtdlpArgs(pageUrl, tmpFile, 720, true);
     const child = spawn(ytdlpPath, args);
 
     let stderrBuf = '';
@@ -360,55 +375,78 @@ app.get('/api/download', (req, res) => {
     const safeTitle = (title || 'download').replace(/[^a-zA-Z0-9\u4e00-\u9fa5_\-]/g, '_');
     console.log(`[下载] ${safeTitle} <- ${decodedUrl.substring(0, 60)}...`);
 
-    const tmpFile = path.join(os.tmpdir(), `dl_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
-    const args = buildYtdlpArgs(decodedUrl, tmpFile, null);
+    // 实际下载逻辑（支持重试）
+    const doDownload = (attempt) => {
+        const tmpFile = path.join(os.tmpdir(), `dl_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
+        // 第一次用严格模式（强制视频），失败后用宽松模式
+        const args = buildYtdlpArgs(decodedUrl, tmpFile, null, attempt === 1);
 
-    console.log(`[下载] yt-dlp args:`, args.slice(1).join(' '));
-    const child = spawn(ytdlpPath, args);
+        console.log(`[下载] 尝试 #${attempt}, yt-dlp args:`, args.slice(1).join(' '));
+        const child = spawn(ytdlpPath, args);
 
-    let stderrBuf = '';
-    child.stdout.on('data', d => {});
-    child.stderr.on('data', d => { const m = d.toString(); stderrBuf += m; });
+        let stderrBuf = '';
+        child.stdout.on('data', d => { console.log('[下载 stdout]', d.toString().trim()); });
+        child.stderr.on('data', d => { const m = d.toString(); stderrBuf += m; });
 
-    child.on('error', err => {
-        console.error('[下载错误]', err.message);
-        fs.unlink(tmpFile, () => {});
-        if (!res.headersSent) res.status(500).send('下载失败');
-    });
-
-    child.on('close', code => {
-        if (code !== 0) {
-            console.error('[下载] 失败:', stderrBuf.substring(0, 300));
+        child.on('error', err => {
+            console.error('[下载错误]', err.message);
             fs.unlink(tmpFile, () => {});
-            if (!res.headersSent) return res.status(500).send('下载失败');
-            return;
-        }
+            if (!res.headersSent) res.status(500).send('下载失败');
+        });
 
-        const actualFile = findOutputFile(tmpFile);
-        if (!actualFile) {
-            console.error('[下载] 找不到输出文件');
-            if (!res.headersSent) res.status(500).send('下载失败：文件未生成');
-            return;
-        }
+        child.on('close', code => {
+            if (code !== 0) {
+                console.error(`[下载] 尝试 #${attempt} 失败:`, stderrBuf.substring(0, 300));
+                // 如果严格视频模式失败（没有视频格式匹配），用宽松模式重试
+                if (attempt === 1) {
+                    console.log('[下载] 严格视频模式失败，用宽松模式重试...');
+                    fs.unlink(tmpFile, () => {});
+                    return doDownload(2);
+                }
+                fs.unlink(tmpFile, () => {});
+                if (!res.headersSent) return res.status(500).send('下载失败');
+                return;
+            }
 
-        const stat = fs.statSync(actualFile);
-        console.log(`[下载] 完成: ${(stat.size / 1024 / 1024).toFixed(1)}MB -> ${path.basename(actualFile)}`);
+            const actualFile = findOutputFile(tmpFile);
+            if (!actualFile) {
+                console.error('[下载] 找不到输出文件');
+                if (attempt === 1) { fs.unlink(tmpFile, () => {}); return doDownload(2); }
+                if (!res.headersSent) res.status(500).send('下载失败：文件未生成');
+                return;
+            }
 
-        const ext = path.extname(actualFile).toLowerCase() || '.mp4';
-        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeTitle)}${ext}"`);
-        res.setHeader('Content-Type', 'video/mp4');
-        res.setHeader('Content-Length', stat.size);
+            const stat = fs.statSync(actualFile);
+            const sizeMB = (stat.size / 1024 / 1024).toFixed(1);
+            const hasVideo = probeHasVideo(actualFile);
+            console.log(`[下载] 尝试 #${attempt} 完成: ${sizeMB}MB, 含视频=${hasVideo}`);
 
-        const stream = fs.createReadStream(actualFile);
-        stream.pipe(res);
-        stream.on('end', () => fs.unlink(actualFile, () => {}));
-        stream.on('error', () => { fs.unlink(actualFile, () => {}); if (!res.headersSent) res.status(500).send('下载失败'); });
-    });
+            // 第一次下载得到纯音频 → 宽松模式重试
+            if (!hasVideo && attempt === 1) {
+                console.log('[下载] 输出是纯音频，用宽松模式重试...');
+                fs.unlink(actualFile, () => {});
+                return doDownload(2);
+            }
 
-    res.on('close', () => {
-        if (!child.killed) child.kill();
-        setTimeout(() => fs.unlink(tmpFile, () => {}), 5000);
-    });
+            const ext = path.extname(actualFile).toLowerCase() || '.mp4';
+            const contentType = hasVideo ? 'video/mp4' : 'audio/mp4';
+            res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeTitle)}${ext}"`);
+            res.setHeader('Content-Type', contentType);
+            res.setHeader('Content-Length', stat.size);
+
+            const stream = fs.createReadStream(actualFile);
+            stream.pipe(res);
+            stream.on('end', () => fs.unlink(actualFile, () => {}));
+            stream.on('error', () => { fs.unlink(actualFile, () => {}); if (!res.headersSent) res.status(500).send('下载失败'); });
+        });
+
+        res.on('close', () => {
+            if (!child.killed) child.kill();
+            setTimeout(() => fs.unlink(tmpFile, () => {}), 5000);
+        });
+    };
+
+    doDownload(1);
 });
 
 app.listen(PORT, () => console.log(`[启动] http://localhost:${PORT}`));
