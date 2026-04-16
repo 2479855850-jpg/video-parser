@@ -597,14 +597,48 @@
             position: fixed;
             inset: 0;
             z-index: 300;
-            background: rgba(0, 0, 0, 0.92);
+            background: rgba(0, 0, 0, 0.95);
             display: none;
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            padding: 20px;
         }
         .modal-overlay.visible { display: flex; }
+
+        /* 顶部返回栏 - 手机上必须明显 */
+        .modal-topbar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 56px;
+            z-index: 310;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 16px;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+        }
+        .modal-back-btn {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 14px;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            background: rgba(255, 255, 255, 0.08);
+            color: #fff;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-family: inherit;
+        }
+        .modal-back-btn:hover, .modal-back-btn:active { background: rgba(255, 255, 255, 0.15); }
+        .modal-back-btn svg { width: 18px; height: 18px; }
+
         .modal-inner {
             position: relative;
             width: 100%;
@@ -612,51 +646,34 @@
             display: flex;
             flex-direction: column;
             align-items: center;
+            padding: 64px 16px 16px;
         }
         .modal-content {
             width: 100%;
-            max-height: 80vh;
+            max-height: calc(100vh - 120px);
             display: flex;
             align-items: center;
             justify-content: center;
-            border-radius: 16px;
+            border-radius: 12px;
             overflow: hidden;
         }
         .modal-content video {
             width: 100%;
-            max-height: 80vh;
-            border-radius: 16px;
+            max-height: calc(100vh - 120px);
+            border-radius: 12px;
             outline: none;
             background: #000;
         }
         .modal-content img {
             max-width: 100%;
-            max-height: 80vh;
+            max-height: calc(100vh - 120px);
             object-fit: contain;
-            border-radius: 16px;
+            border-radius: 12px;
         }
-        .modal-close {
-            position: absolute;
-            top: -48px;
-            right: 0;
-            width: 36px;
-            height: 36px;
-            border-radius: 10px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            background: rgba(255, 255, 255, 0.06);
-            color: rgba(255, 255, 255, 0.6);
-            font-size: 20px;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: all 0.2s;
-        }
-        .modal-close:hover { background: #ef4444; color: #fff; border-color: #ef4444; }
 
         .gallery-nav {
             display: none;
-            margin-top: 16px;
+            margin-top: 12px;
             align-items: center;
             gap: 16px;
             padding: 8px 20px;
@@ -674,6 +691,7 @@
             font-size: 13px;
             cursor: pointer;
             transition: all 0.2s;
+            font-family: inherit;
         }
         .gallery-nav button:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
         .gallery-nav .indicator {
@@ -813,6 +831,12 @@
 
     <!-- Preview Modal -->
     <div id="preview-modal" class="modal-overlay">
+        <div class="modal-topbar">
+            <button id="close-modal" class="modal-back-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"></path><path d="M12 19L5 12L12 5"></path></svg>
+                <span id="back-text">返回</span>
+            </button>
+        </div>
         <div class="modal-inner">
             <div id="modal-content" class="modal-content"></div>
             <div id="gallery-controls" class="gallery-nav">
@@ -820,7 +844,6 @@
                 <span id="gallery-indicator" class="indicator">1 / 1</span>
                 <button id="next-img">&rarr;</button>
             </div>
-            <button id="close-modal" class="modal-close">&times;</button>
         </div>
     </div>
 
@@ -924,8 +947,19 @@
         let currentIndex = 0;
         let isCurrentVideo = true;
 
-        const openModal = () => { modal.classList.add('visible'); document.body.style.overflow = 'hidden'; };
-        const closeModal = () => { modalContent.innerHTML = ''; modal.classList.remove('visible'); document.body.style.overflow = ''; };
+        const openModal = () => {
+            modal.classList.add('visible');
+            document.body.style.overflow = 'hidden';
+            document.getElementById('back-text').textContent = currentLang === 'zh' ? '返回' : 'Back';
+        };
+        const closeModal = () => {
+            // 停止视频播放
+            const v = modalContent.querySelector('video');
+            if (v) { v.pause(); v.src = ''; }
+            modalContent.innerHTML = '';
+            modal.classList.remove('visible');
+            document.body.style.overflow = '';
+        };
 
         const renderModalContent = () => {
             modalContent.innerHTML = '';
@@ -1009,7 +1043,8 @@
                 btn.innerHTML = currentLang === 'zh' ? '下载中...' : 'Downloading...';
                 const safeTitle = title.replace(/[^a-zA-Z0-9\u4e00-\u9fa5_\-]/g, '_') || 'download';
                 document.getElementById('download-iframe').src = `/api/download?pageUrl=${encodeURIComponent(pageUrl)}&title=${encodeURIComponent(safeTitle)}`;
-                setTimeout(() => { if (btn.disabled) window.resetDownloadStatus(); }, 3000);
+                // 下载需要服务器先用 yt-dlp 下载，可能需要较长时间
+                setTimeout(() => { if (btn.disabled) window.resetDownloadStatus(); }, 60000);
             });
 
             updateAllText(currentLang);
