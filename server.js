@@ -289,7 +289,31 @@ const startTask = (url, type, maxHeight) => {
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// --- 解析接口（不变）---
+// --- 多策略解析（自动重试，解决 Render 出口 IP 抖动/Twitter guest token 偶发失效）---
+const UA_POOL = [
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+];
+
+const tryParseOnce = async (url, strategy) => {
+    const opts = {
+        dumpJson: true, noWarnings: true, noPlaylist: true,
+        socketTimeout: 15,
+        addHeader: [`User-Agent:${UA_POOL[strategy % UA_POOL.length]}`]
+    };
+    if (/douyin\.com|iesdouyin\.com|twitter\.com|x\.com|instagram\.com/.test(url)) {
+        const cp = path.join(__dirname, 'cookies.txt');
+        if (fs.existsSync(cp)) opts.cookies = cp;
+        else if (hasChromeAvailable) opts.cookiesFromBrowser = 'chrome';
+    }
+    // Twitter/X 专用：第 2 次重试时切 syndication API（更稳定，不需要 guest token）
+    if (strategy >= 1 && /twitter\.com|x\.com/.test(url)) {
+        opts.extractorArgs = 'twitter:api=syndication';
+    }
+    return await youtubedl(url, opts);
+};
+
 app.post('/api/parse', async (req, res) => {
     const { url } = req.body;
     console.log(`[请求] ${url}`);
@@ -297,18 +321,34 @@ app.post('/api/parse', async (req, res) => {
     if (!isValidUrl(url)) return res.status(400).json({ success: false, message: '链接格式无效' });
     if (isUnsupportedHost(url)) return res.status(400).json({ success: false, message: UNSUPPORTED_MSG });
 
-    try {
-        const opts = {
-            dumpJson: true, noWarnings: true, noPlaylist: true,
-            addHeader: ['User-Agent:Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36']
-        };
-        if (/douyin\.com|iesdouyin\.com|twitter\.com|x\.com|instagram\.com/.test(url)) {
-            const cp = path.join(__dirname, 'cookies.txt');
-            if (fs.existsSync(cp)) opts.cookies = cp;
-            else if (hasChromeAvailable) opts.cookiesFromBrowser = 'chrome';
+    let metadata = null;
+    let lastErr = null;
+    const MAX_ATTEMPTS = 3;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        try {
+            if (attempt > 0) console.log(`[重试 ${attempt}/${MAX_ATTEMPTS - 1}] ${url.substring(0, 80)}`);
+            metadata = await tryParseOnce(url, attempt);
+            if (metadata) break;
+        } catch (err) {
+            lastErr = err;
+            const rawMsg = err.stderr || err.message || '';
+            // 链接本身无效 / 平台不支持 → 不用重试，直接返回
+            if (/Unsupported URL|Video unavailable|Private|404|No video could be found/i.test(rawMsg)) {
+                break;
+            }
+            console.log(`[尝试 ${attempt + 1} 失败] ${rawMsg.substring(0, 150)}`);
+            // 简单退避 500ms / 1s
+            if (attempt < MAX_ATTEMPTS - 1) await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
         }
+    }
 
-        const metadata = await youtubedl(url, opts);
+    if (!metadata) {
+        const rawMsg = lastErr?.stderr || lastErr?.message || '';
+        console.error(`[最终失败]`, rawMsg.substring(0, 200));
+        return res.status(500).json({ success: false, message: friendlyError(rawMsg) });
+    }
+
+    try {
         console.log(`[成功] ${metadata.title}`);
 
         let videoUrl = metadata.url || '';
