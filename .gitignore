@@ -5,3 +5,4 @@ cookies.txt
 .env
 *.log
 package-lock.json
+.claude/

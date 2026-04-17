@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>VideoParser - 全平台视频解析</title>
-    <meta name="description" content="支持 YouTube、Bilibili、Instagram、Twitter 等 1800+ 平台的视频解析下载工具">
+    <meta name="description" content="支持 YouTube、Bilibili、Twitter/X、TikTok、Facebook 等海外主流平台的视频解析下载工具">
     <style>
         /* ===== Reset & Base ===== */
         *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
@@ -784,21 +784,24 @@
                 <div class="platform-item"><span class="dot"></span><span class="name">YouTube</span><span class="desc">视频 / Shorts / 播放列表</span></div>
                 <div class="platform-item"><span class="dot"></span><span class="name">Bilibili (B站)</span><span class="desc">视频 / 番剧</span></div>
                 <div class="platform-item"><span class="dot"></span><span class="name">Twitter / X</span><span class="desc">视频推文</span></div>
-                <div class="platform-item"><span class="dot"></span><span class="name">Instagram</span><span class="desc">Reels / 帖子</span></div>
+                <div class="platform-item"><span class="dot"></span><span class="name">TikTok</span><span class="desc">短视频</span></div>
                 <div class="platform-item"><span class="dot"></span><span class="name">Facebook</span><span class="desc">视频 / Reels</span></div>
                 <div class="platform-item"><span class="dot"></span><span class="name">Vimeo</span><span class="desc">视频</span></div>
                 <div class="platform-item"><span class="dot"></span><span class="name">Twitch</span><span class="desc">回放 / 片段</span></div>
-                <div class="platform-item"><span class="dot"></span><span class="name">Dailymotion</span><span class="desc">视频</span></div>
+                <div class="platform-item"><span class="dot"></span><span class="name">SoundCloud</span><span class="desc">音频</span></div>
             </div>
 
-            <div class="section-label" id="sidebar-other-label" style="color: rgba(255,255,255,0.3); font-size: 10px; margin-top: 16px;">更多 · 1800+ 站点</div>
+            <div class="section-label" id="sidebar-other-label" style="color: rgba(255,255,255,0.3); font-size: 10px; margin-top: 16px;">更多 · 部分海外站点</div>
             <p id="sidebar-other-desc" style="font-size: 12px; color: rgba(255,255,255,0.35); line-height: 1.6;">
-                基于 yt-dlp 引擎，还支持 TikTok、Reddit、Pinterest、Tumblr、SoundCloud、Nicovideo 等 1800+ 个站点。直接粘贴链接试试！
+                基于 yt-dlp 引擎，还可尝试 Reddit、Pinterest、Tumblr、Dailymotion、Nicovideo 等海外站点。直接粘贴链接试试。
             </p>
 
             <div class="unsupported-box">
                 <div class="label" id="sidebar-unsupported-label">暂不支持</div>
-                <div class="desc" id="sidebar-unsupported-desc">抖音、快手、小红书（因平台反爬限制，暂不支持解析）</div>
+                <div class="desc" id="sidebar-unsupported-desc">Instagram、抖音、快手、微博、小红书（因平台反爬升级，目前无法稳定解析）</div>
+                <div class="desc" id="sidebar-alt-desc" style="margin-top:8px; padding-top:8px; border-top:1px dashed rgba(255,255,255,0.08);">
+                    建议改用专业服务：<a href="https://instagram.iiilab.com" target="_blank" rel="noopener" style="color:#a78bfa; text-decoration:none;">iiilab</a>、<a href="https://snapany.com/zh" target="_blank" rel="noopener" style="color:#a78bfa; text-decoration:none;">SnapAny</a>
+                </div>
             </div>
         </div>
     </aside>
@@ -811,8 +814,8 @@
                     <polygon points="5 3 19 12 5 21 5 3"></polygon>
                 </svg>
             </div>
-            <h1 id="hero-title">全平台视频解析</h1>
-            <p id="hero-desc">粘贴任意视频链接，即可解析、预览和下载。支持 1800+ 平台。</p>
+            <h1 id="hero-title">海外视频解析下载</h1>
+            <p id="hero-desc">支持 YouTube、B 站、Twitter/X、TikTok、Facebook 等海外主流平台。</p>
         </div>
 
         <div id="chat-history" class="chat-area"></div>
@@ -873,8 +876,8 @@
                 'error-prefix': 'Error: ',
                 'error-default': 'Failed to parse.',
                 'invalid-link': 'Invalid link format. Please try again.',
-                'hero-title': 'Universal Video Parser',
-                'hero-desc': 'Paste any video link to parse, preview and download. Supports 1800+ platforms.'
+                'hero-title': 'Overseas Video Downloader',
+                'hero-desc': 'Supports YouTube, Bilibili, Twitter/X, TikTok, Facebook and more.'
             },
             zh: {
                 'paste-placeholder': '粘贴视频链接...',
@@ -887,8 +890,8 @@
                 'error-prefix': '错误：',
                 'error-default': '链接解析失败。',
                 'invalid-link': '链接格式无效，请检查后重试',
-                'hero-title': '全平台视频解析',
-                'hero-desc': '粘贴任意视频链接，即可解析、预览和下载。支持 1800+ 平台。'
+                'hero-title': '海外视频解析下载',
+                'hero-desc': '支持 YouTube、B 站、Twitter/X、TikTok、Facebook 等海外主流平台。'
             }
         };
         let currentLang = 'zh';
@@ -1148,6 +1151,13 @@
             return m ? m[0] : null;
         };
 
+        // 已知不支持的平台 → 直接提示，不浪费一次后端调用
+        const UNSUPPORTED_HOSTS = /(instagram\.com|douyin\.com|iesdouyin\.com|kuaishou\.com|kwai\.com|weibo\.com|weibo\.cn|xiaohongshu\.com|xhslink\.com)/i;
+        const detectUnsupported = (url) => {
+            try { return UNSUPPORTED_HOSTS.test(new URL(url).hostname); }
+            catch { return false; }
+        };
+
         const handleUrlSubmission = async (rawText) => {
             const url = extractUrl(rawText);
             if (!url) { triggerInputError(); return; }
@@ -1156,6 +1166,15 @@
             addMessage(rawText, 'user');
             urlInput.value = '';
             resultsContainer.innerHTML = '';
+
+            // 不支持的平台直接给出友好提示
+            if (detectUnsupported(url)) {
+                const tip = currentLang === 'zh'
+                    ? '该平台（Instagram / 抖音 / 快手 / 微博 / 小红书）因反爬升级，本站暂时无法解析。<br>建议改用专业服务：<a href="https://instagram.iiilab.com" target="_blank" rel="noopener" style="color:#a78bfa;">iiilab</a> 或 <a href="https://snapany.com/zh" target="_blank" rel="noopener" style="color:#a78bfa;">SnapAny</a>'
+                    : 'This platform (Instagram / Douyin / Kuaishou / Weibo / Xiaohongshu) is currently blocked by anti-scraping upgrades.<br>Try a dedicated service: <a href="https://instagram.iiilab.com" target="_blank" rel="noopener" style="color:#a78bfa;">iiilab</a> or <a href="https://snapany.com" target="_blank" rel="noopener" style="color:#a78bfa;">SnapAny</a>';
+                addMessage(tip, 'bot', true);
+                return;
+            }
 
             const loadingHTML = `<span data-translate-key="parsing-message">${translations[currentLang]['parsing-message']}</span> <span class="loading-dots"><span></span><span></span><span></span></span>`;
             addMessage(loadingHTML, 'bot', true);
@@ -1209,10 +1228,11 @@
                 tip: '<strong>提示：</strong>支持直接粘贴包含链接的分享文本，系统会自动识别其中的链接。',
                 platformsTitle: '支持平台',
                 recLabel: '推荐 · 稳定支持',
-                otherLabel: '更多 · 1800+ 站点',
-                otherDesc: '基于 yt-dlp 引擎，还支持 TikTok、Reddit、Pinterest、Tumblr、SoundCloud、Nicovideo 等 1800+ 个站点。直接粘贴链接试试！',
+                otherLabel: '更多 · 部分海外站点',
+                otherDesc: '基于 yt-dlp 引擎，还可尝试 Reddit、Pinterest、Tumblr、Dailymotion、Nicovideo 等海外站点。直接粘贴链接试试。',
                 unsupportedLabel: '暂不支持',
-                unsupportedDesc: '抖音、快手、小红书（因平台反爬限制，暂不支持解析）'
+                unsupportedDesc: 'Instagram、抖音、快手、微博、小红书（因平台反爬升级，目前无法稳定解析）',
+                altDesc: '建议改用专业服务：<a href="https://instagram.iiilab.com" target="_blank" rel="noopener" style="color:#a78bfa; text-decoration:none;">iiilab</a>、<a href="https://snapany.com/zh" target="_blank" rel="noopener" style="color:#a78bfa; text-decoration:none;">SnapAny</a>'
             },
             en: {
                 title: 'Guide',
@@ -1221,10 +1241,11 @@
                 tip: '<strong>Tip:</strong> You can paste share text containing a link — the system will auto-detect it.',
                 platformsTitle: 'Supported Platforms',
                 recLabel: 'Recommended · Stable',
-                otherLabel: 'More · 1800+ Sites',
-                otherDesc: 'Powered by yt-dlp engine, also supports TikTok, Reddit, Pinterest, Tumblr, SoundCloud, Nicovideo and 1800+ more sites. Just paste a link and try!',
+                otherLabel: 'More · Other Sites',
+                otherDesc: 'Powered by yt-dlp engine. You can also try Reddit, Pinterest, Tumblr, Dailymotion, Nicovideo and more. Just paste a link.',
                 unsupportedLabel: 'Not Supported',
-                unsupportedDesc: 'Douyin, Kuaishou, Xiaohongshu (blocked by platform anti-scraping)'
+                unsupportedDesc: 'Instagram, Douyin, Kuaishou, Weibo, Xiaohongshu — blocked by platform anti-scraping upgrades.',
+                altDesc: 'Try a dedicated service instead: <a href="https://instagram.iiilab.com" target="_blank" rel="noopener" style="color:#a78bfa; text-decoration:none;">iiilab</a>, <a href="https://snapany.com" target="_blank" rel="noopener" style="color:#a78bfa; text-decoration:none;">SnapAny</a>'
             }
         };
 
@@ -1241,6 +1262,8 @@
             document.getElementById('sidebar-other-desc').textContent = t.otherDesc;
             document.getElementById('sidebar-unsupported-label').textContent = t.unsupportedLabel;
             document.getElementById('sidebar-unsupported-desc').textContent = t.unsupportedDesc;
+            const altEl = document.getElementById('sidebar-alt-desc');
+            if (altEl) altEl.innerHTML = t.altDesc;
         };
 
         const openSidebar = () => {

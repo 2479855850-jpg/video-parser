@@ -32,8 +32,23 @@ const isValidUrl = (str) => {
     catch { return false; }
 };
 
+// 已知反爬死锁平台 → 直接拒绝，避免占用 30s yt-dlp 进程
+const UNSUPPORTED_HOST = /(instagram\.com|douyin\.com|iesdouyin\.com|kuaishou\.com|kwai\.com|weibo\.com|weibo\.cn|xiaohongshu\.com|xhslink\.com)/i;
+const isUnsupportedHost = (str) => {
+    try { return UNSUPPORTED_HOST.test(new URL(str).hostname); }
+    catch { return false; }
+};
+const UNSUPPORTED_MSG = '该平台因反爬升级暂无法解析（Instagram / 抖音 / 快手 / 微博 / 小红书）。建议改用 iiilab.com 或 snapany.com 等专业服务';
+
 const friendlyError = (msg) => {
     if (!msg) return '解析失败，请检查链接是否正确或稍后重试';
+    // 已知不支持的平台优先匹配（兜底，前端没拦住时）
+    if (/instagram/i.test(msg) || /empty.*response/i.test(msg)) return 'Instagram 因平台反爬升级，本站暂无法解析。建议改用 iiilab.com 等专业服务';
+    if (/douyin|iesdouyin/i.test(msg) || /Fresh cookies/i.test(msg)) return '抖音因平台反爬升级，本站暂无法解析。建议改用专业服务';
+    if (/kuaishou|kwai/i.test(msg)) return '快手 yt-dlp 提取器已失效，本站暂无法解析';
+    if (/weibo/i.test(msg)) return '微博 yt-dlp 提取器异常，本站暂无法解析';
+    if (/xiaohongshu|xhslink/i.test(msg) || /No video formats/i.test(msg)) return '小红书 yt-dlp 提取器异常，本站暂无法解析';
+    // 通用错误
     if (/cookie/i.test(msg) || /login|sign.?in/i.test(msg)) return '该平台需要登录后才能访问此内容';
     if (/Video unavailable/i.test(msg)) return '视频不可用，可能已被删除';
     if (/Private/i.test(msg)) return '该视频为私密视频，无法解析';
@@ -44,8 +59,6 @@ const friendlyError = (msg) => {
     if (/403|Forbidden/i.test(msg)) return '访问被拒绝，请稍后重试';
     if (/404/.test(msg)) return '内容不存在 (404)';
     if (/timed?\s*out/i.test(msg)) return '请求超时，请检查网络后重试';
-    if (/empty.*response/i.test(msg)) return 'Instagram 需要登录才能访问，暂不支持该平台';
-    if (/instagram/i.test(msg)) return 'Instagram 接口受限，暂不支持该平台';
     return '解析失败，请检查链接是否正确或稍后重试';
 };
 
@@ -282,6 +295,7 @@ app.post('/api/parse', async (req, res) => {
     console.log(`[请求] ${url}`);
     if (!url) return res.status(400).json({ success: false, message: '提供链接为空' });
     if (!isValidUrl(url)) return res.status(400).json({ success: false, message: '链接格式无效' });
+    if (isUnsupportedHost(url)) return res.status(400).json({ success: false, message: UNSUPPORTED_MSG });
 
     try {
         const opts = {
@@ -393,6 +407,7 @@ app.get('/api/stream/:id', async (req, res) => {
 app.post('/api/prepare', (req, res) => {
     const { url, type } = req.body;
     if (!url || !isValidUrl(url)) return res.status(400).json({ error: '无效链接' });
+    if (isUnsupportedHost(url)) return res.status(400).json({ error: UNSUPPORTED_MSG });
     const maxHeight = type === 'preview' ? 720 : null;
     const taskId = startTask(url, type || 'download', maxHeight);
     res.json({ taskId });
